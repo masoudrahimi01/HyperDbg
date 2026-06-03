@@ -101,6 +101,27 @@
       <TreatLinkerWarningAsErrors>true</TreatLinkerWarningAsErrors>
     </Link>
   </ItemDefinitionGroup>
+  <!--
+    Optional Intel libipt decoding for the !pt example. Set the LIBIPT_ROOT
+    environment variable (or MSBuild property) to a libipt install laid out as
+    LIBIPT_ROOT\include\intel-pt.h, LIBIPT_ROOT\lib\libipt.lib,
+    LIBIPT_ROOT\bin\libipt.dll. When set, this defines USE_LIBIPT, links
+    libipt and copies the DLL next to the exe. When unset (the default), the
+    project builds unchanged and hyperdbg_app just prints a capture summary.
+  -->
+  <ItemDefinitionGroup Condition="'$(LIBIPT_ROOT)'!=''">
+    <ClCompile>
+      <PreprocessorDefinitions>USE_LIBIPT;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(LIBIPT_ROOT)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(LIBIPT_ROOT)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>libipt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <PostBuildEvent>
+      <Command>copy /Y "$(LIBIPT_ROOT)\bin\libipt.dll" "$(OutDir)"</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
