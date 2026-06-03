@@ -133,6 +133,7 @@ DrvDispatchIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     PHYPERTRACE_LBR_OPERATION_PACKETS                       HyperTraceLbrOperationRequest;
     PHYPERTRACE_LBR_DUMP_PACKETS                            HyperTraceLbrdumpRequest;
     PHYPERTRACE_PT_OPERATION_PACKETS                        HyperTracePtOperationRequest;
+    PHYPERTRACE_PT_MMAP_PACKETS                             HyperTracePtMmapRequest;
     PVOID                                                   BufferToStoreThreadsAndProcessesDetails;
     NTSTATUS                                                Status;
     ULONG                                                   InBuffLength;  // Input buffer length
@@ -1073,6 +1074,18 @@ DrvDispatchIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             }
 
             //
+            // If the caller asked to filter on a process id (and did not
+            // already supply an explicit CR3), resolve the PID to its CR3
+            // here so PT traces only that process.
+            //
+            if (HyperTracePtOperationRequest->TargetProcessId != 0 &&
+                HyperTracePtOperationRequest->TargetCr3 == 0)
+            {
+                HyperTracePtOperationRequest->TargetCr3 =
+                    LayoutGetCr3ByProcessId(HyperTracePtOperationRequest->TargetProcessId).Flags;
+            }
+
+            //
             // Perform the HyperTrace PT operation
             //
             HyperTracePtPerformOperation(HyperTracePtOperationRequest);
@@ -1081,6 +1094,36 @@ DrvDispatchIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             // Adjust the status and output size
             //
             DrvAdjustStatusAndSetOutputSize(SIZEOF_HYPERTRACE_PT_OPERATION_PACKETS, &DoNotChangeInformation, Irp, &Status);
+
+            break;
+
+        case IOCTL_PERFORM_HYPERTRACE_PT_MMAP:
+
+            //
+            // Validate and adjust the parameters, and set the target buffer to the system buffer of the IRP
+            //
+            if (!DrvValidateAndAdjustIoctlParameter(SIZEOF_HYPERTRACE_PT_MMAP_PACKETS,
+                                                    (PVOID *)&HyperTracePtMmapRequest,
+                                                    Irp,
+                                                    IrpStack,
+                                                    &InBuffLength,
+                                                    &OutBuffLength))
+            {
+                Status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            //
+            // Map the per-CPU PT buffers into the calling user process. This
+            // runs in the requestor's context so the returned VAs are valid
+            // in the user application that issued the IOCTL.
+            //
+            HyperTracePtMmap(HyperTracePtMmapRequest);
+
+            //
+            // Adjust the status and output size
+            //
+            DrvAdjustStatusAndSetOutputSize(SIZEOF_HYPERTRACE_PT_MMAP_PACKETS, &DoNotChangeInformation, Irp, &Status);
 
             break;
 

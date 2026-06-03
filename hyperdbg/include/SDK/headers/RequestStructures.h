@@ -1355,10 +1355,13 @@ typedef struct _HYPERTRACE_PT_OPERATION_PACKETS
     //
     UINT32        TraceUser;     /* Boolean: trace CPL > 0                 */
     UINT32        TraceKernel;   /* Boolean: trace CPL == 0                */
-    UINT64        TargetCr3;     /* CR3 to filter by (0 = no filter)       */
-    UINT64        BufferSize;    /* Output buffer size (0 = keep current)  */
-    UINT32        NumAddrRanges; /* Number of valid AddrRanges entries     */
-    UINT32        Reserved;      /* Padding to keep the array 8-aligned    */
+    UINT64        TargetCr3;       /* CR3 to filter by (0 = no filter)       */
+    UINT64        BufferSize;      /* Output buffer size (0 = keep current)  */
+    UINT32        NumAddrRanges;   /* Number of valid AddrRanges entries     */
+    UINT32        TargetProcessId; /* If non-zero and TargetCr3 == 0, the
+                                      driver resolves this PID to its CR3 so
+                                      PT filters on that process only. Also
+                                      keeps the array below 8-aligned.       */
     PT_ADDR_RANGE AddrRanges[PT_MAX_ADDR_RANGES];
 
     //
