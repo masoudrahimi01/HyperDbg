@@ -37,6 +37,12 @@ extern LIST_ENTRY g_OutputSources;
 extern DEBUGGER_SYNCRONIZATION_EVENTS_STATE
     g_UserSyncronizationObjectsHandleTable[DEBUGGER_MAXIMUM_SYNCRONIZATION_USER_DEBUGGER_OBJECTS];
 
+VOID
+MasoudCallbackHandler(PUINT64 TagBuffer)
+{
+    ShowMessages("Masoud callback handler called from user with tag: %llx\n", *TagBuffer);
+}
+
 /**
  * @brief Set the function callback that will be called if any message
  * needs to be shown
@@ -427,6 +433,13 @@ ReadIrpBasedBuffer()
                     //
                     UdHandleUserDebuggerPausing(
                         (PDEBUGGEE_UD_PAUSED_PACKET)(OutputBuffer + sizeof(UINT32)));
+
+                    break;
+
+                case OPERATION_MASOUD_CALLBACK:
+
+                    MasoudCallbackHandler(
+                        (PUINT64)(OutputBuffer + sizeof(UINT32)));
 
                     break;
 

@@ -270,6 +270,9 @@ VOID
 ScriptEngineFunctionLbrStop();
 
 UINT64
+ScriptEngineFunctionMasoudCallback(UINT64 Tag);
+
+UINT64
 ScriptEngineFunctionStrcmp(const char * Address1, const char * Address2);
 
 UINT64
