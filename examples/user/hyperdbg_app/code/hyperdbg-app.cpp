@@ -33,7 +33,7 @@ LoadVmm()
 int
 main(int argc, char ** argv)
 {
-    return main2(argc, argv);
+    // return main2(argc, argv);
 
     if (LoadVmm() != 0)
     {
@@ -41,6 +41,11 @@ main(int argc, char ** argv)
     }
 
     hyperdbg_u_run_command((CHAR*)"lm");
+
+    //
+    // Test EPT hooks
+    //
+    hyperdbg_u_run_command((CHAR*)"!epthook 0x123 script { masoud_callback(0x123); }");
 
     printf("[*] unloading HyperDbg VMM...\n");
 

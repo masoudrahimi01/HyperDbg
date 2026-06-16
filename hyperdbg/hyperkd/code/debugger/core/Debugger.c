@@ -12,6 +12,27 @@
  */
 #include "pch.h"
 
+BOOLEAN
+MasoudPrologue(PVOID        Context,
+               GUEST_REGS * Regs)
+{
+    UNREFERENCED_PARAMETER(Context);
+    UNREFERENCED_PARAMETER(Regs);
+
+    // return TRUE; // Means that registers/memory is adjusted and does not need to call user-mode callback (Epilogue won't be called)
+    // return FALSE; // Means that help from user-mode is needed, callback in the user-mode will be called (Epilogue will be called again to adjust registers from user-mode)
+
+    return TRUE;
+}
+
+VOID
+MasoudEpilogue(PVOID        Context,
+               GUEST_REGS * Regs)
+{
+    UNREFERENCED_PARAMETER(Context);
+    UNREFERENCED_PARAMETER(Regs);
+}
+
 /**
  * @brief A wrapper for GetRegValue() in script-engine
  *
@@ -178,7 +199,6 @@ DebuggerInitializeVmmOperations()
     InitializeListHead(&g_Events->ControlRegisterModifiedEventsHead);
     InitializeListHead(&g_Events->XsetbvInstructionExecutionEventsHead);
 
-
     //
     // Initialize NMI broadcasting mechanism
     //
@@ -194,7 +214,7 @@ DebuggerInitializeVmmOperations()
     //
     VmFuncSetTriggerEventForCpuids(FALSE);
 
-        //
+    //
     // Pre-allocate pools for possible EPT hooks
     //
     ConfigureEptHookReservePreallocatedPoolsForEptHooks(MAXIMUM_NUMBER_OF_INITIAL_PREALLOCATED_EPT_HOOKS);
@@ -207,7 +227,6 @@ DebuggerInitializeVmmOperations()
         // BTW, won't fail the starting phase because of this
         //
     }
-
 
     //
     // Enabled Debugger VMX Events
@@ -1155,9 +1174,11 @@ DebuggerTriggerEvents(VMM_EVENT_TYPE_ENUM                   EventType,
     DebuggerCheckForCondition *      ConditionFunc;
     DEBUGGER_TRIGGERED_EVENT_DETAILS EventTriggerDetail = {0};
     PEPT_HOOKS_CONTEXT               EptContext;
-    PLIST_ENTRY                      TempList        = 0;
-    PLIST_ENTRY                      TempList2       = 0;
-    const PVOID                      OriginalContext = Context;
+    PLIST_ENTRY                      TempList         = 0;
+    PLIST_ENTRY                      TempList2        = 0;
+    const PVOID                      OriginalContext  = Context;
+    BOOLEAN                          SkipUserModeCall = FALSE;
+    BOOLEAN                          CallEpilogue     = FALSE;
 
     //
     // Check if triggering debugging actions are allowed or not
@@ -1310,6 +1331,20 @@ DebuggerTriggerEvents(VMM_EVENT_TYPE_ENUM                   EventType,
                 // The hook is not for this (virtual) address
                 //
                 continue;
+            }
+
+            //
+            // Call the prologue function
+            //
+            SkipUserModeCall = MasoudPrologue(Context, Regs);
+
+            if (SkipUserModeCall)
+            {
+                continue;
+            }
+            else
+            {
+                CallEpilogue = TRUE;
             }
 
             break;
@@ -1565,6 +1600,14 @@ DebuggerTriggerEvents(VMM_EVENT_TYPE_ENUM                   EventType,
         // perform the actions
         //
         DebuggerPerformActions(DbgState, CurrentEvent, &EventTriggerDetail);
+
+        //
+        // Check if Epilogue needs to be called
+        //
+        if (CallEpilogue)
+        {
+            MasoudEpilogue(Context, Regs);
+        }
     }
 
     //
