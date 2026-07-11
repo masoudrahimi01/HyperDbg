@@ -22,6 +22,18 @@ extern BOOLEAN g_IsMessageLoggingWindowClosed;
 extern BOOLEAN g_BreakPrintingOutput;
 extern BOOLEAN g_OutputSourcesInitialized;
 
+//
+// User-settable Masoud callback (NULL => use the built-in handler below).
+// Installed via hyperdbg_u_set_masoud_callback(); defined in globals.h.
+//
+extern PVOID g_MasoudCallback;
+
+//
+// Signature of a Masoud callback handler. Mirrors MasoudCallbackHandler so a
+// consumer-supplied handler is call-compatible.
+//
+typedef VOID (*MASOUD_CALLBACK_HANDLER)(PUINT64 TagBuffer);
+
 VOID
 MasoudCallbackHandler(PUINT64 TagBuffer)
 {
@@ -294,8 +306,21 @@ ReadIrpBasedBuffer()
 
             case OPERATION_MASOUD_CALLBACK:
 
-                MasoudCallbackHandler(
-                    (PUINT64)(OutputBuffer + sizeof(UINT32)));
+                //
+                // Prefer a consumer-installed handler (e.g. WinAFL via
+                // hyperdbg_u_set_masoud_callback); fall back to the built-in
+                // one when none is registered.
+                //
+                if (g_MasoudCallback != NULL)
+                {
+                    ((MASOUD_CALLBACK_HANDLER)g_MasoudCallback)(
+                        (PUINT64)(OutputBuffer + sizeof(UINT32)));
+                }
+                else
+                {
+                    MasoudCallbackHandler(
+                        (PUINT64)(OutputBuffer + sizeof(UINT32)));
+                }
 
                 break;
 

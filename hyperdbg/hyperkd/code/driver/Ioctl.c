@@ -1569,6 +1569,7 @@ DrvDispatchHyperTraceIoControl(PIRP Irp, PIO_STACK_LOCATION IrpStack, BOOLEAN * 
     PHYPERTRACE_LBR_DUMP_PACKETS      HyperTraceLbrdumpRequest;
     PHYPERTRACE_PT_OPERATION_PACKETS  HyperTracePtOperationRequest;
     PHYPERTRACE_PT_MMAP_PACKETS       HyperTracePtMmapRequest;
+    PWINAFL_HOOK_ARM_PACKETS          WinaflHookArmRequest;
     ULONG                             InBuffLength;
     ULONG                             OutBuffLength;
     NTSTATUS                          Status = STATUS_SUCCESS;
@@ -1716,6 +1717,68 @@ DrvDispatchHyperTraceIoControl(PIRP Irp, PIO_STACK_LOCATION IrpStack, BOOLEAN * 
         // Adjust the status and output size
         //
         DrvAdjustStatusAndSetOutputSize(SIZEOF_HYPERTRACE_PT_MMAP_PACKETS, DoNotChangeInformation, Irp, &Status);
+
+        break;
+
+    case IOCTL_PERFORM_WINAFL_HOOK_ARM:
+
+        //
+        // Validate and adjust the parameters, and set the target buffer to the system buffer of the IRP
+        //
+        if (!DrvValidateAndAdjustIoctlParameter(SIZEOF_WINAFL_HOOK_ARM_PACKETS,
+                                                (PVOID *)&WinaflHookArmRequest,
+                                                Irp,
+                                                IrpStack,
+                                                &InBuffLength,
+                                                &OutBuffLength))
+        {
+            Status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        //
+        // Pin the fuzzer's shared page and arm the persistence hooks. Runs in
+        // the caller (fuzzer) context at PASSIVE_LEVEL, as MmProbeAndLockPages
+        // requires. The packet's KernelStatus carries the result; a non-success
+        // value is the raw NTSTATUS for diagnostics.
+        //
+        Status = WinaflHookArm(WinaflHookArmRequest->SharedUserVa,
+                               WinaflHookArmRequest->SharedSize);
+
+        WinaflHookArmRequest->KernelStatus =
+            NT_SUCCESS(Status) ? DEBUGGER_OPERATION_WAS_SUCCESSFUL : (UINT32)Status;
+
+        //
+        // Adjust the status and output size (always returns the packet)
+        //
+        DrvAdjustStatusAndSetOutputSize(SIZEOF_WINAFL_HOOK_ARM_PACKETS, DoNotChangeInformation, Irp, &Status);
+
+        break;
+
+    case IOCTL_PERFORM_WINAFL_HOOK_DISARM:
+
+        //
+        // Validate and adjust the parameters, and set the target buffer to the system buffer of the IRP
+        //
+        if (!DrvValidateAndAdjustIoctlParameter(SIZEOF_WINAFL_HOOK_ARM_PACKETS,
+                                                (PVOID *)&WinaflHookArmRequest,
+                                                Irp,
+                                                IrpStack,
+                                                &InBuffLength,
+                                                &OutBuffLength))
+        {
+            Status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        //
+        // Disarm the hooks and release the pinned page
+        //
+        WinaflHookDisarm();
+
+        WinaflHookArmRequest->KernelStatus = DEBUGGER_OPERATION_WAS_SUCCESSFUL;
+
+        DrvAdjustStatusAndSetOutputSize(SIZEOF_WINAFL_HOOK_ARM_PACKETS, DoNotChangeInformation, Irp, &Status);
 
         break;
 

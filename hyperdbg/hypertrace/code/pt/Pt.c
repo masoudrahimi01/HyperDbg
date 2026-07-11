@@ -438,12 +438,18 @@ PtEngineAllocateBuffers(PT_PER_CPU * Cpu, const PT_TRACE_CONFIG * Config)
     Topa = Cpu->Buffer.TopaVa;
 
     //
-    // Entry 0: main data buffer, INT=1 (trigger PMI when full)
+    // Entry 0: main data buffer. INT=0: do NOT raise a PMI when this region
+    // fills. The ToPA is circular (entry 2 = END wraps back here), so on fill the
+    // hardware simply rolls into the overflow zone and wraps -- which the WinAFL
+    // collector already handles as a ring (collect_pt_ring). INT=1 would raise a
+    // ToPA-full PMI that HyperDbg has NO handler for (PtEngineHandlePmi is dead
+    // code, no perfmon-LVT/NMI handler), so under fast continuous tracing the
+    // unhandled PMI bug-checks the machine once the buffer first fills. Keep it 0.
     //
     Topa[0].Value    = 0;
     Topa[0].BaseAddr = Cpu->Buffer.OutputPhysical >> 12;
     Topa[0].Size     = (UINT64)SizeEncoding;
-    Topa[0].Int      = 1;
+    Topa[0].Int      = 0;
     Topa[0].Stop     = 0;
 
     //
@@ -891,7 +897,16 @@ PtEnginePause(PT_PER_CPU * Cpu)
 {
     PT_RTIT_CTL_REGISTER Ctl;
 
-    if (Cpu == NULL || Cpu->State != PT_STATE_TRACING)
+    //
+    // Gate ONLY on "is PT started on this core" (TRACING or already PAUSED) -- a
+    // positive enabled-check so an unstarted core (DISABLED/READY/STOPPED) is never
+    // touched. We deliberately do NOT gate on the exact PAUSED-vs-TRACING sub-state:
+    // clearing TraceEn is a read-modify-write of the LIVE RTIT_CTL and is idempotent
+    // (pausing an already-paused core just rewrites TraceEn=0), so the per-iteration
+    // bracket can never desync. The old `!= TRACING` guard turned a single stale
+    // sub-state into a silent no-op that broke tracing until the next full restart.
+    //
+    if (Cpu == NULL || (Cpu->State != PT_STATE_TRACING && Cpu->State != PT_STATE_PAUSED))
         return -1;
 
     Ctl.Value   = __readmsr(MSR_IA32_RTIT_CTL);
@@ -910,10 +925,21 @@ PtEngineResume(PT_PER_CPU * Cpu)
 {
     PT_RTIT_CTL_REGISTER Ctl;
 
-    if (Cpu == NULL || Cpu->State != PT_STATE_PAUSED)
+    //
+    // Same positive "is PT started on this core" gate as PtEnginePause (TRACING or
+    // PAUSED), NOT the exact sub-state -- so a missed/duplicated pause can never
+    // wedge resume into a permanent no-op the way the old `!= PAUSED` guard could.
+    //
+    // Resume by reading the LIVE RTIT_CTL and setting TraceEn=1, NOT by restoring
+    // Cpu->SavedCtl: pause only clears the TraceEn bit, so every other config bit
+    // (IP-filter ranges, BranchEn, ...) is still live in the register, and a live
+    // read can never drift relative to a separately-held snapshot. The write is
+    // idempotent (resuming an already-tracing core just rewrites TraceEn=1).
+    //
+    if (Cpu == NULL || (Cpu->State != PT_STATE_TRACING && Cpu->State != PT_STATE_PAUSED))
         return -1;
 
-    Ctl         = Cpu->SavedCtl;
+    Ctl.Value   = __readmsr(MSR_IA32_RTIT_CTL);
     Ctl.TraceEn = 1;
     __writemsr(MSR_IA32_RTIT_CTL, Ctl.Value);
 
@@ -1307,6 +1333,49 @@ PtResume()
     LogInfo("PT: resuming trace on core %u\n", CurrentCore);
 
     PtEngineResume(Cpu);
+}
+
+//
+// VMX-root-safe, NO-LOG pause/resume of PT on the CURRENT core. These exist for
+// WinAFL's persistence hooks (hyperkd MasoudPrologue/Epilogue), which bracket
+// each fuzz iteration's trace from inside the VM-exit handler:
+//   - they MUST NOT log: a LogInfo per iteration from VMX-root floods the log
+//     path at full fuzzing speed and bug-checks the box after a few hundred runs;
+//   - they MUST NOT broadcast: HyperTracePtPause/Resume use DPC/IPI across all
+//     cores, which is illegal from a VM-exit handler. These touch only the
+//     calling (pinned) core's IA32_RTIT_CTL.TraceEn -- a plain MSR toggle.
+//
+VOID
+HyperTracePtPauseCurrentCore()
+{
+    UINT32 CurrentCore;
+
+    if (g_PtStateList == NULL)
+        return;
+
+    CurrentCore = KeGetCurrentProcessorNumberEx(NULL);
+    PtEnginePause(&g_PtStateList[CurrentCore]);
+}
+
+VOID
+HyperTracePtResumeCurrentCore()
+{
+    UINT32 CurrentCore;
+
+    if (g_PtStateList == NULL)
+        return;
+
+    //
+    // NOTE: do NOT rewind IA32_RTIT_OUTPUT_MASK_PTRS here. Rewriting that PT MSR
+    // from VMX-root every iteration (without also redoing PtEngineStart's full
+    // sequence -- clear TraceEn, RTIT_STATUS=0, OUTPUT_BASE) leaves the PT engine
+    // in an inconsistent state that compounds and bug-checks the machine after
+    // ~100 iterations. The per-iteration buffer rewind has to be solved another
+    // way (user-side delta, or a fuller safe reset). Keep this to the TraceEn
+    // toggle only, which is proven stable over thousands of iterations.
+    //
+    CurrentCore = KeGetCurrentProcessorNumberEx(NULL);
+    PtEngineResume(&g_PtStateList[CurrentCore]);
 }
 
 /**

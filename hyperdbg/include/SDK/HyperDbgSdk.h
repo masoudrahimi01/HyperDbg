@@ -29,6 +29,11 @@
 #include "SDK/headers/PtDefinitions.h"
 
 //
+// WinAFL <-> HyperDbg persistence/coverage contract (MasoudPrologue/Epilogue)
+//
+#include "SDK/headers/WinaflHookDefinitions.h"
+
+//
 // Request Packets
 //
 #include "SDK/headers/RequestStructures.h"

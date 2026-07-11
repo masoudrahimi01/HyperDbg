@@ -88,6 +88,18 @@ HyperTracePtPause(HYPERTRACE_PT_OPERATION_PACKETS * PtOperationRequest);
 IMPORT_EXPORT_HYPERTRACE BOOLEAN
 HyperTracePtResume(HYPERTRACE_PT_OPERATION_PACKETS * PtOperationRequest);
 
+//
+// Pause / resume PT on the CURRENT core only -- no DPC broadcast, no logging, just
+// an IA32_RTIT_CTL.TraceEn toggle. Safe to call from VMX-root (unlike
+// HyperTracePtPause/Resume above). WinAFL's persistence hooks use these to bracket
+// each fuzz iteration's trace at the guest transitions on the pinned core.
+//
+IMPORT_EXPORT_HYPERTRACE VOID
+HyperTracePtPauseCurrentCore();
+
+IMPORT_EXPORT_HYPERTRACE VOID
+HyperTracePtResumeCurrentCore();
+
 IMPORT_EXPORT_HYPERTRACE BOOLEAN
 HyperTracePtSize(HYPERTRACE_PT_OPERATION_PACKETS * PtOperationRequest);
 

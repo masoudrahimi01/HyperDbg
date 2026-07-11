@@ -237,6 +237,21 @@ DebuggerTriggerEvents(VMM_EVENT_TYPE_ENUM                   EventType,
                       BOOLEAN *                             PostEventRequired,
                       GUEST_REGS *                          Regs);
 
+//
+// WinAFL persistence hooks (MasoudPrologue/MasoudEpilogue) arming surface.
+// WinaflHookArm pins the fuzzer-allocated WINAFL_HOOK_SHARED page and publishes
+// its system VA so the in-VMX-root hooks can reach it from any process context;
+// WinaflHookDisarm releases it. WinaflHookSetSharedPage is the low-level setter.
+//
+VOID
+WinaflHookSetSharedPage(PWINAFL_HOOK_SHARED Shared);
+
+NTSTATUS
+WinaflHookArm(UINT64 SharedUserVa, UINT32 SharedSize);
+
+VOID
+WinaflHookDisarm();
+
 PDEBUGGER_EVENT
 DebuggerGetEventByTag(UINT64 Tag);
 

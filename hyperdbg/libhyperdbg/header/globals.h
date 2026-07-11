@@ -466,6 +466,15 @@ PVOID g_MessageHandler = 0;
 PVOID g_MessageHandlerSharedBuffer = 0;
 
 /**
+ * @brief The user-settable handler for Masoud callbacks
+ * (OPERATION_MASOUD_CALLBACK). When NULL, the built-in MasoudCallbackHandler
+ * is used instead. Set via hyperdbg_u_set_masoud_callback(); mirrors the
+ * g_MessageHandler mechanism above.
+ *
+ */
+PVOID g_MasoudCallback = 0;
+
+/**
  * @brief Shows whether the message logging window is closed or not
  *
  */

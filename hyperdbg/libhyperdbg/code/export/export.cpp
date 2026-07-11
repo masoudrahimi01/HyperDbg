@@ -279,6 +279,129 @@ hyperdbg_u_unset_text_message_callback()
     UnsetTextMessageCallback();
 }
 
+//
+// Defined in globals.h (single definition site); externed here so the setter
+// can install the WinAFL Masoud callback. Mirrors g_MessageHandler.
+//
+extern PVOID g_MasoudCallback;
+
+/**
+ * @brief Set the function callback that is invoked when the kernel raises a
+ * Masoud callback (OPERATION_MASOUD_CALLBACK). This mirrors the text-message
+ * callback mechanism so consumers (e.g. WinAFL) can receive in-kernel
+ * notifications without HyperDbg knowing anything about the consumer.
+ *
+ * The handler signature is: VOID (*)(UINT64 * tag_buffer)
+ * where tag_buffer points at the UINT64 tag the kernel sent.
+ *
+ * Pass NULL to restore the built-in handler. Safe to call before or after the
+ * VMM is loaded.
+ *
+ * @param handler Function that handles the callback
+ *
+ * @return VOID
+ */
+VOID
+hyperdbg_u_set_masoud_callback(PVOID handler)
+{
+    g_MasoudCallback = handler;
+}
+
+/**
+ * @brief Unset the Masoud callback installed by hyperdbg_u_set_masoud_callback().
+ *
+ * @return VOID
+ */
+VOID
+hyperdbg_u_unset_masoud_callback()
+{
+    g_MasoudCallback = NULL;
+}
+
+//
+// Device handle to the HyperDbg driver (opened by the driver loader). Used to
+// issue the WinAFL arm/disarm IOCTLs below.
+//
+extern HANDLE g_DeviceHandle;
+
+/**
+ * @brief Arm the WinAFL persistence hooks by pinning the caller-allocated
+ * WINAFL_HOOK_SHARED page. The caller fills the page's configuration fields,
+ * then passes its user VA + size here. Local (VMI) mode only.
+ *
+ * @param shared_user_va User VA of the WINAFL_HOOK_SHARED page
+ * @param shared_size    Its size in bytes (>= sizeof(WINAFL_HOOK_SHARED))
+ *
+ * @return BOOLEAN TRUE on success
+ */
+BOOLEAN
+hyperdbg_u_winafl_hook_arm(UINT64 shared_user_va, UINT32 shared_size)
+{
+    WINAFL_HOOK_ARM_PACKETS Request = {0};
+    BOOL                    Status;
+    ULONG                   ReturnedLength;
+
+    if (g_DeviceHandle == NULL)
+    {
+        ShowMessages("err, the driver is not loaded\n");
+        return FALSE;
+    }
+
+    Request.SharedUserVa = shared_user_va;
+    Request.SharedSize   = shared_size;
+
+    Status = DeviceIoControl(g_DeviceHandle,
+                             IOCTL_PERFORM_WINAFL_HOOK_ARM,
+                             &Request,
+                             SIZEOF_WINAFL_HOOK_ARM_PACKETS,
+                             &Request,
+                             SIZEOF_WINAFL_HOOK_ARM_PACKETS,
+                             &ReturnedLength,
+                             NULL);
+
+    if (!Status)
+    {
+        ShowMessages("ioctl failed with code 0x%x\n", GetLastError());
+        return FALSE;
+    }
+
+    return Request.KernelStatus == DEBUGGER_OPERATION_WAS_SUCCESSFUL;
+}
+
+/**
+ * @brief Disarm the WinAFL persistence hooks and release the pinned page.
+ *
+ * @return BOOLEAN TRUE on success
+ */
+BOOLEAN
+hyperdbg_u_winafl_hook_disarm()
+{
+    WINAFL_HOOK_ARM_PACKETS Request = {0};
+    BOOL                    Status;
+    ULONG                   ReturnedLength;
+
+    if (g_DeviceHandle == NULL)
+    {
+        return FALSE;
+    }
+
+    Status = DeviceIoControl(g_DeviceHandle,
+                             IOCTL_PERFORM_WINAFL_HOOK_DISARM,
+                             &Request,
+                             SIZEOF_WINAFL_HOOK_ARM_PACKETS,
+                             &Request,
+                             SIZEOF_WINAFL_HOOK_ARM_PACKETS,
+                             &ReturnedLength,
+                             NULL);
+
+    if (!Status)
+    {
+        return FALSE;
+    }
+
+    return Request.KernelStatus == DEBUGGER_OPERATION_WAS_SUCCESSFUL;
+}
+
 /**
  * @brief Parsing the command line options for scripts
  * @param argc

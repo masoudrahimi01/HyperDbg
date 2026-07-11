@@ -428,3 +428,20 @@
  */
 #define IOCTL_PERFORM_HYPERTRACE_PT_MMAP \
     CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_HYPERTRACE_IOCTL + 0x05, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+/**
+ * @brief ioctl, to arm the WinAFL persistence hooks (MasoudPrologue/Epilogue)
+ *        by pinning the fuzzer-allocated WINAFL_HOOK_SHARED page. See
+ *        WINAFL_HOOK_ARM_PACKETS.
+ *
+ */
+#define IOCTL_PERFORM_WINAFL_HOOK_ARM \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_HYPERTRACE_IOCTL + 0x06, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+/**
+ * @brief ioctl, to disarm the WinAFL persistence hooks and release the pinned
+ *        WINAFL_HOOK_SHARED page.
+ *
+ */
+#define IOCTL_PERFORM_WINAFL_HOOK_DISARM \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_HYPERTRACE_IOCTL + 0x07, METHOD_BUFFERED, FILE_ANY_ACCESS)

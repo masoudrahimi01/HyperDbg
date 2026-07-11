@@ -12,25 +12,495 @@
  */
 #include "pch.h"
 
+//
+// ===================== WinAFL HyperDbg persistence hooks =====================
+//
+// MasoudPrologue / MasoudEpilogue implement WinAFL's persistent-mode fuzzing on
+// top of HyperDbg. They are called from DebuggerTriggerEvents() for every
+// HIDDEN_HOOK_EXEC_CC (!epthook) hit, in VMX-root, with:
+//     Context = the hooked guest virtual address,
+//     Regs    = the guest GP registers (rax..r15, rsp).
+//
+// They are COMPLETELY INERT until the fuzzer arms them by publishing a shared
+// control page via WinaflHookSetSharedPage(): when g_WinaflHookShared is NULL, or
+// the hooked address is not one of ours, MasoudPrologue returns FALSE so ordinary
+// !epthook events keep their normal behaviour (their actions run; the epilogue is
+// a no-op for non-WinAFL addresses).
+//
+// v1 fuzzes a USER-mode target, so every register/stack edit below only ever
+// changes a user process — a mistake can at worst crash the harness, never the
+// kernel. The hook bodies still run in root, so they stay minimal and defensive.
+//
+// The three addresses we hook (all in the target process, scoped to its PID by
+// the event itself) are:
+//     FuzzAddress     - the fuzzed function entry  (prologue / rewind landing)
+//     ReturnAddress   - captured from [rsp] at the first entry (epilogue point)
+//     ParkStubAddress - a tiny guest spin stub we park at between iterations
+//
+
+//
+// Per-iteration kernel logging is OFF by default. These hooks run in VMX-root on
+// EVERY fuzz iteration; emitting several LogInfo lines + a guest-stack read each
+// time floods HyperDbg's VMX-root log path at full fuzzing speed (there is no
+// IOCTL backpressure once PT is bracketed in the kernel), which bug-checks the box
+// after a few hundred iterations. Set WINAFL_HOOK_KERNEL_VERBOSE to 1 (and rebuild
+// hyperkd) ONLY for bring-up, paired with the user-side HOOK_DEBUG_LOGS=1 so the
+// lines are actually printed. WINAFL_KLOG compiles to nothing when disabled.
+//
+#define WINAFL_HOOK_KERNEL_VERBOSE 0
+
+#if WINAFL_HOOK_KERNEL_VERBOSE
+#    define WINAFL_KLOG(...) LogInfo(__VA_ARGS__)
+#else
+#    define WINAFL_KLOG(...) ((VOID)0)
+#endif
+
+//
+// Published by the WinAFL arm IOCTL. Points at the non-paged shared control page
+// that is also mapped into the fuzzer. NULL => disarmed (hooks inert).
+//
+PWINAFL_HOOK_SHARED g_WinaflHookShared = NULL;
+
+//
+// MDL backing the pinned fuzzer page, kept so WinaflHookDisarm can release it.
+//
+static PMDL g_WinaflHookMdl = NULL;
+
+VOID
+WinaflHookSetSharedPage(PWINAFL_HOOK_SHARED Shared)
+{
+    g_WinaflHookShared = Shared;
+}
+
+//
+// Arm the hooks: pin the fuzzer's WINAFL_HOOK_SHARED page into a system VA that
+// is valid from VMX-root in any process context, validate its ABI, and publish
+// it. Runs at PASSIVE_LEVEL in the fuzzer's context (the IOCTL caller), which is
+// required by MmProbeAndLockPages.
+//
+NTSTATUS
+WinaflHookArm(UINT64 SharedUserVa, UINT32 SharedSize)
+{
+    PMDL                Mdl;
+    PVOID               SystemVa;
+    PWINAFL_HOOK_SHARED Shared;
+
+    if (g_WinaflHookShared != NULL || g_WinaflHookMdl != NULL)
+    {
+        //
+        // Already armed; require an explicit disarm first.
+        //
+        return STATUS_DEVICE_ALREADY_ATTACHED;
+    }
+
+    if (SharedUserVa == (UINT64)NULL || SharedSize < sizeof(WINAFL_HOOK_SHARED))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    Mdl = IoAllocateMdl((PVOID)SharedUserVa, SharedSize, FALSE, FALSE, NULL);
+    if (Mdl == NULL)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    __try
+    {
+        //
+        // Lock the user pages (write access: the kernel updates Status/snapshot).
+        //
+        MmProbeAndLockPages(Mdl, UserMode, IoModifyAccess);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        IoFreeMdl(Mdl);
+        return STATUS_ACCESS_VIOLATION;
+    }
+
+    //
+    // Resolve a non-paged system VA for the locked pages. MdlMappingNoExecute is
+    // correct for a pure data page and satisfies modern WDK requirements.
+    //
+    SystemVa = MmGetSystemAddressForMdlSafe(Mdl, NormalPagePriority);
+    if (SystemVa == NULL)
+    {
+        MmUnlockPages(Mdl);
+        IoFreeMdl(Mdl);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
+    // Validate the ABI before trusting any field the hooks will read.
+    //
+    Shared = (PWINAFL_HOOK_SHARED)SystemVa;
+    if (Shared->Version != WINAFL_HOOK_ABI_VERSION ||
+        Shared->StructSize != sizeof(WINAFL_HOOK_SHARED))
+    {
+        MmUnlockPages(Mdl);
+        IoFreeMdl(Mdl);
+        return STATUS_REVISION_MISMATCH;
+    }
+
+    Shared->Status = WINAFL_STATUS_ARMED;
+
+    LogInfo("[winafl] armed: shared=0x%llx fuzz=0x%llx park=0x%llx pid=%u",
+            (UINT64)Shared, Shared->FuzzAddress, Shared->ParkStubAddress, Shared->TargetProcessId);
+
+    //
+    // Publish last: once g_WinaflHookShared is non-NULL the hooks are live.
+    //
+    g_WinaflHookMdl    = Mdl;
+    g_WinaflHookShared = Shared;
+
+    return STATUS_SUCCESS;
+}
+
+//
+// Disarm the hooks and release the pinned page. The hooks read g_WinaflHookShared
+// first thing and treat NULL as "inert", so clearing it before unlocking makes
+// teardown safe (the v1 target runs single-threaded on its pinned core and is
+// parked or dead by the time the fuzzer disarms).
+//
+VOID
+WinaflHookDisarm()
+{
+    PMDL Mdl = g_WinaflHookMdl;
+
+    g_WinaflHookShared = NULL;
+    g_WinaflHookMdl    = NULL;
+
+    if (Mdl != NULL)
+    {
+        MmUnlockPages(Mdl);
+        IoFreeMdl(Mdl);
+    }
+}
+
+//
+// Wake the fuzzer with a WINAFL_HOOK_TAG. The per-iteration detail already lives
+// in the shared page; the tag only says *why* we woke it. This is the same
+// immediate-buffer path ScriptEngineFunctionMasoudCallback uses, so it is safe
+// from the VMX-root event-trigger context.
+//
+static VOID
+WinaflHookNotify(UINT64 Tag)
+{
+    LogCallbackSendBuffer(OPERATION_MASOUD_CALLBACK, &Tag, sizeof(Tag), TRUE);
+}
+
+//
+// Dump the guest GP registers + the top of the guest stack at a hook transition.
+// Used during bring-up to confirm the per-iteration rewind keeps the stack
+// consistent: RSP and the saved return address at [rsp] must be IDENTICAL on
+// every iteration -- any drift here is the "stack corruption" we are watching
+// for. The stack is read through the CR3-aware safe mapper so a bad RSP cannot
+// fault us in VMX-root.
+//
+static VOID
+WinaflHookLogState(const char * Where, GUEST_REGS * Regs)
+{
+#if WINAFL_HOOK_KERNEL_VERBOSE
+    UINT64  Stack[6] = {0};
+    BOOLEAN StackOk  = MemoryMapperReadMemorySafeOnTargetProcess(Regs->rsp, Stack, sizeof(Stack));
+
+    LogInfo("[winafl] %s regs: rsp=0x%llx rbp=0x%llx rax=0x%llx rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx",
+            Where, Regs->rsp, Regs->rbp, Regs->rax, Regs->rcx, Regs->rdx, Regs->r8, Regs->r9);
+
+    if (StackOk)
+        LogInfo("[winafl] %s stack@rsp: [0]=0x%llx [1]=0x%llx [2]=0x%llx [3]=0x%llx [4]=0x%llx [5]=0x%llx",
+                Where, Stack[0], Stack[1], Stack[2], Stack[3], Stack[4], Stack[5]);
+    else
+        LogInfo("[winafl] %s stack@rsp=0x%llx: <unreadable>", Where, Regs->rsp);
+#else
+    UNREFERENCED_PARAMETER(Where);
+    UNREFERENCED_PARAMETER(Regs);
+#endif
+}
+
+//
+// Capture the state we rewind to every iteration. For a file-based v1 harness the
+// arguments do not change between runs, so the GP registers + RSP + the return
+// address (read from [rsp]) fully reconstitute the call. (Callconv-aware argument
+// capture into SavedArgs[] is deferred to v1.2's register/memory input delivery.)
+//
+static VOID
+WinaflHookSnapshotEntry(PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs)
+{
+    UINT64 ReturnAddress = 0;
+
+    //
+    // GUEST_REGS and WINAFL_HOOK_REGS share an identical layout (rax..r15), so a
+    // straight copy captures every GP register, including rsp.
+    //
+    RtlCopyMemory(&Shared->SavedRegs, Regs, sizeof(WINAFL_HOOK_REGS));
+    Shared->SavedRsp = Regs->rsp;
+
+    //
+    // The return address is the top of the guest stack at entry. Read it through
+    // the safe, CR3-aware mapper so a bad stack pointer cannot fault us in root.
+    //
+    if (MemoryMapperReadMemorySafeOnTargetProcess(Regs->rsp, &ReturnAddress, sizeof(ReturnAddress)))
+    {
+        Shared->ReturnAddress = ReturnAddress;
+    }
+}
+
+//
+// Park the guest: reset RSP to the saved entry value and point RIP at the spin
+// stub. The stub is stackless, so SavedRsp simply keeps RSP on the real stack.
+//
+// The redirect is honoured by HyperDbg's !epthook machinery: the EPT-hook
+// breakpoint handler (EptCheckAndHandleBreakpoint in hyperhv/.../Ept.c) calls
+// HvSuppressRipIncrement() before triggering our event and never re-writes
+// GUEST_RIP afterwards, so our VmFuncSetRip() is the last writer and takes
+// effect on VM-entry. The subsequent MTF only re-arms the hooked page.
+//
+static VOID
+WinaflHookPark(PWINAFL_HOOK_SHARED Shared)
+{
+    SetGuestRSP(Shared->SavedRsp);
+    VmFuncSetRip(Shared->ParkStubAddress);
+}
+
+//
+// Hit on the fuzzed function entry.
+//
+static BOOLEAN
+WinaflHookOnEntry(PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs)
+{
+    if (!Shared->FirstHitDone)
+    {
+        //
+        // First ever entry: capture the rewind snapshot + the return address,
+        // tell the fuzzer (so it can install the return-address hook AND drop
+        // this entry hook), and park until it releases us. We must NOT run the
+        // function before the return hook is installed, or we would miss the
+        // epilogue.
+        //
+        WinaflHookSnapshotEntry(Shared, Regs);
+        Shared->FirstHitDone = 1;
+        Shared->Status       = WINAFL_STATUS_ENTRY;
+        WINAFL_KLOG("[winafl] ENTRY (first hit): snapshot captured, return=0x%llx park=0x%llx",
+                    Shared->ReturnAddress, Shared->ParkStubAddress);
+        WinaflHookLogState("ENTRY", Regs);
+        WinaflHookNotify(WINAFL_TAG_ENTRY);
+        WinaflHookPark(Shared);
+        return TRUE; // handled in kernel: skip user-mode actions + epilogue
+    }
+
+    //
+    // One-hook-at-a-time design: after the first hit the fuzzer removes this
+    // entry breakpoint (it shares a physical page with the return address, and
+    // two hidden-CC breakpoints on one page was crashing the dry run). Every
+    // later iteration is released from the park stub, which restores the snapshot
+    // and jumps here directly -- so we should never re-enter via a breakpoint. If
+    // we do, the entry CC was left in place: log loudly, restore the snapshot,
+    // and let it run so the guest is not wedged.
+    //
+    LogInfo("[winafl] WARNING: unexpected later ENTRY breakpoint (entry CC should have been removed)");
+    RtlCopyMemory(Regs, &Shared->SavedRegs, sizeof(WINAFL_HOOK_REGS));
+    SetGuestRSP(Shared->SavedRsp);
+    WinaflHookLogState("ENTRY(late)", Regs);
+    return TRUE;
+}
+
+//
+// Hit on the captured return address: the iteration finished. Returning FALSE
+// asks the dispatcher to run the (empty) event actions and then call
+// MasoudEpilogue, where we rewind + park.
+//
+static BOOLEAN
+WinaflHookOnReturn(PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs)
+{
+    //
+    // The iteration has returned: stop tracing immediately, on THIS (pinned) core,
+    // before we rewind + park. Current-core RTIT_CTL toggle only (no DPC/log), so
+    // it is valid here in VMX-root. Bracketing PT in the hooks -- not from a
+    // user-mode IOCTL after the async ITER_DONE notification -- captures exactly
+    // this iteration with no resume/pause race clipping the start or trailing end.
+    //
+    HyperTracePtPauseCurrentCore();
+
+    Shared->IterationCount++;
+    Shared->Status = WINAFL_STATUS_ITER_DONE;
+    WINAFL_KLOG("[winafl] RETURN breakpoint: iteration %lld returned (PT paused)", Shared->IterationCount);
+    WinaflHookLogState("RETURN", Regs);
+    return FALSE; // run the (empty) event action, then MasoudEpilogue rewinds + parks
+}
+
+//
+// Park poll via CPUID (replaces the old epthook-on-a-spin-stub park). The parked
+// guest runs a delay loop and executes CPUID, which forces a VM-exit; we get here
+// from the CPUID dispatch (DebuggerTriggerEvents' CPUID case). The delay loop means
+// ONE VM-exit per ~1M iterations instead of an epthook #BP every couple of
+// instructions -- far less overhead while waiting for GO.
+//
+// Returns TRUE iff this was our park CPUID AND we released/teared-down the guest
+// (RIP redirected); the caller then short-circuits so HvHandleCpuid does NOT also
+// advance RIP. Returns FALSE for "not our CPUID" or "still idle" so the caller lets
+// normal CPUID emulation run (advancing RIP -> the guest loops back through the
+// delay and polls again).
+//
+static BOOLEAN
+WinaflHookOnParkCpuid(PROCESSOR_DEBUGGING_STATE * DbgState)
+{
+    PWINAFL_HOOK_SHARED Shared = g_WinaflHookShared;
+    UINT64              Rip;
+
+    if (Shared == NULL)
+        return FALSE;
+
+    //
+    // Is this CPUID our park stub? The stub is a tiny, isolated VirtualAllocEx page
+    // ([delay loop][cpuid][jmp]); any CPUID with RIP inside it is a park poll. Other
+    // CPUIDs in the target (CRT, etc.) have RIP elsewhere -> not ours.
+    //
+    Rip = VmFuncGetRip();
+    if (Rip < Shared->ParkStubAddress || Rip >= Shared->ParkStubAddress + 0x40)
+        return FALSE;
+
+    if (Shared->Command == WINAFL_CMD_GO)
+    {
+        //
+        // Release into the next iteration: restore the snapshotted GP registers +
+        // RSP (RSP must go through SetGuestRSP -- it is VMCS state), resume PT on
+        // this pinned core, and jump straight to the fuzz entry. The caller
+        // short-circuits the event so HvHandleCpuid does not advance RIP over our
+        // redirect.
+        //
+        Shared->Command = WINAFL_CMD_IDLE;
+        RtlCopyMemory(DbgState->Regs, &Shared->SavedRegs, sizeof(WINAFL_HOOK_REGS));
+        SetGuestRSP(Shared->SavedRsp);
+        WINAFL_KLOG("[winafl] park(cpuid): GO -> resume at fuzz=0x%llx (iter=%lld)",
+                    Shared->FuzzAddress, Shared->IterationCount);
+        HyperTracePtResumeCurrentCore();
+        VmFuncSetRip(Shared->FuzzAddress);
+        //
+        // CRITICAL: suppress the VM-exit framework's default RIP increment. Unlike
+        // the EPT-hook (#BP) path -- where EptCheckAndHandleBreakpoint already calls
+        // HvSuppressRipIncrement -- the CPUID exit leaves IncrementRip=TRUE, so
+        // without this the framework would advance our redirected RIP by the CPUID
+        // length (FuzzAddress -> FuzzAddress+2), landing mid-instruction and running
+        // garbage. ShortCircuitingEvent (below) only skips HvHandleCpuid's
+        // emulation/reg-clobber; it does NOT stop the framework increment.
+        //
+        VmFuncSuppressRipIncrement(DbgState->CoreId);
+        DbgState->ShortCircuitingEvent = TRUE;
+        return TRUE;
+    }
+
+    if (Shared->Command == WINAFL_CMD_STOP)
+    {
+        //
+        // Tear down: restore the snapshot, resume normally from the fuzz entry, and
+        // disarm so the hooks become inert again.
+        //
+        Shared->Command = WINAFL_CMD_IDLE;
+        RtlCopyMemory(DbgState->Regs, &Shared->SavedRegs, sizeof(WINAFL_HOOK_REGS));
+        SetGuestRSP(Shared->SavedRsp);
+        WINAFL_KLOG("[winafl] park(cpuid): STOP -> disarm, resume at fuzz=0x%llx", Shared->FuzzAddress);
+        VmFuncSetRip(Shared->FuzzAddress);
+        VmFuncSuppressRipIncrement(DbgState->CoreId); // see GO branch
+        g_WinaflHookShared = NULL;
+        DbgState->ShortCircuitingEvent = TRUE;
+        return TRUE;
+    }
+
+    //
+    // WINAFL_CMD_IDLE: keep spinning -- but DO NOT let the event's script action
+    // (masoud_callback(0)) run. Returning FALSE here would fall through to
+    // DebuggerPerformActions, which fires a VMX-root kernel->user notification on
+    // EVERY park poll (thousands/sec while we wait for GO). That flood (a) is the
+    // same VMX-root message-flood pattern that bug-checked the box before, and
+    // (b) races/displaces the real ITER_DONE notification in the message buffer,
+    // so the user-mode wait times out even though the kernel finished the iteration.
+    //
+    // Instead short-circuit the event (ShortCircuitingEvent + return TRUE -> the
+    // caller `continue`s, skipping both the script action AND HvHandleCpuid) but do
+    // NOT call VmFuncSuppressRipIncrement: the VM-exit framework's default
+    // IncrementRip then advances RIP past the CPUID (2 bytes), so the stub's delay
+    // loop simply continues and polls again on the next pass. Skipping HvHandleCpuid
+    // is safe -- the park stub issues CPUID purely as a vmexit trigger and never
+    // reads the result registers.
+    //
+    DbgState->ShortCircuitingEvent = TRUE;
+    return TRUE;
+}
+
 BOOLEAN
 MasoudPrologue(PVOID        Context,
                GUEST_REGS * Regs)
 {
-    UNREFERENCED_PARAMETER(Context);
-    UNREFERENCED_PARAMETER(Regs);
+    PWINAFL_HOOK_SHARED Shared = g_WinaflHookShared;
+    UINT64              Va     = (UINT64)Context;
 
-    // return TRUE; // Means that registers/memory is adjusted and does not need to call user-mode callback (Epilogue won't be called)
-    // return FALSE; // Means that help from user-mode is needed, callback in the user-mode will be called (Epilogue will be called again to adjust registers from user-mode)
+#if WINAFL_HOOK_KERNEL_VERBOSE
+    //
+    // Trace the first calls so we can confirm the hook fires at all and at which
+    // address (capped so the park-stub spin can never flood the log). If NO
+    // "[winafl] prologue" line appears, the !epthook never triggered MasoudPrologue.
+    //
+    {
+        static volatile LONG WinaflDbgCount = 0;
+        if (InterlockedIncrement(&WinaflDbgCount) <= 64)
+            LogInfo("[winafl] prologue: ctx=0x%llx armed=%d fuzz=0x%llx ret=0x%llx park=0x%llx first=%d",
+                    Va,
+                    (Shared != NULL) ? 1 : 0,
+                    (Shared != NULL) ? Shared->FuzzAddress : 0ull,
+                    (Shared != NULL) ? Shared->ReturnAddress : 0ull,
+                    (Shared != NULL) ? Shared->ParkStubAddress : 0ull,
+                    (Shared != NULL) ? Shared->FirstHitDone : 0);
+    }
+#endif
 
-    return TRUE;
+    //
+    // Disarmed, or this hook is not one of ours: return FALSE so the ordinary
+    // !epthook path (its actions, then the no-op epilogue) is preserved.
+    //
+    if (Shared == NULL)
+    {
+        return FALSE;
+    }
+
+    if (Va == Shared->FuzzAddress)
+    {
+        WINAFL_KLOG("[winafl] entry hook hit (first=%d)", Shared->FirstHitDone);
+        return WinaflHookOnEntry(Shared, Regs);
+    }
+
+    if (Shared->FirstHitDone && Va == Shared->ReturnAddress)
+    {
+        WINAFL_KLOG("[winafl] return hook hit (iter=%lld)", Shared->IterationCount);
+        return WinaflHookOnReturn(Shared, Regs);
+    }
+
+    //
+    // NOTE: the park is no longer an epthook. The parked guest polls for GO via a
+    // CPUID delay loop, handled in WinaflHookOnParkCpuid (called from the CPUID
+    // dispatch), so there is no park branch here anymore.
+    //
+    return FALSE;
 }
 
 VOID
 MasoudEpilogue(PVOID        Context,
                GUEST_REGS * Regs)
 {
-    UNREFERENCED_PARAMETER(Context);
+    PWINAFL_HOOK_SHARED Shared = g_WinaflHookShared;
     UNREFERENCED_PARAMETER(Regs);
+
+    //
+    // Only the return-address hook reaches here (the entry/park branches return
+    // TRUE and skip the epilogue). Rewind to the entry, park until the fuzzer
+    // hands us the next input, and notify it the iteration is done.
+    //
+    if (Shared != NULL && (UINT64)Context == Shared->ReturnAddress)
+    {
+        WINAFL_KLOG("[winafl] epilogue: rewind to park=0x%llx (rsp<-0x%llx), notify ITER_DONE",
+                    Shared->ParkStubAddress, Shared->SavedRsp);
+        WinaflHookPark(Shared);
+        WinaflHookNotify(WINAFL_TAG_ITER_DONE);
+    }
 }
 
 /**
@@ -1468,6 +1938,21 @@ DebuggerTriggerEvents(VMM_EVENT_TYPE_ENUM                   EventType,
                 //
                 // The CPUID is not what we want (and the user didn't intend to get all CPUIDs)
                 //
+                continue;
+            }
+
+            //
+            // WinAFL persistence park: the parked guest polls for GO by running a
+            // delay loop + CPUID. If this CPUID is our park stub, handle it and return
+            // TRUE so `continue` skips this event's script action (no per-poll
+            // notification flood) AND HvHandleCpuid, leaving DbgState->ShortCircuitingEvent
+            // set. On GO/STOP the handler redirects RIP + suppresses the increment; on
+            // idle it leaves the increment so RIP advances past the CPUID and the stub
+            // keeps spinning. Only CPUIDs that are NOT our park stub fall through to
+            // normal emulation (so the target's own CPUIDs still get correct results).
+            //
+            if (WinaflHookOnParkCpuid(DbgState))
+            {
                 continue;
             }
 
