@@ -48,7 +48,7 @@
 //////////////////////////////////////////////////
 
 #define PT_PAGE_SIZE           0x1000ULL    /* 4 KB                                  */
-#define PT_DEFAULT_BUFFER_SIZE 0x200000ULL  /* 2 MB                                  */
+#define PT_DEFAULT_BUFFER_SIZE 0x400000ULL  /* 4 MB                                  */
 #define PT_OVERFLOW_SIZE       PT_PAGE_SIZE /* 4 KB overflow landing zone            */
 #define PT_MAX_ADDR_RANGES     4
 
@@ -269,7 +269,7 @@ typedef struct _PT_TRACE_CONFIG
     //
     UINT64 BufferSize; /* Main output buffer size in bytes
                           Must be 4KB * 2^N (4KB, 8KB, ..., 128MB)
-                          Default: PT_DEFAULT_BUFFER_SIZE (2MB)      */
+                          Default: PT_DEFAULT_BUFFER_SIZE (4MB)      */
 } PT_TRACE_CONFIG, *PPT_TRACE_CONFIG;
 
 //////////////////////////////////////////////////

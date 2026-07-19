@@ -66,10 +66,35 @@ PWINAFL_HOOK_SHARED g_WinaflHookShared = NULL;
 //
 static PMDL g_WinaflHookMdl = NULL;
 
+//
+// Batched-execution state (ABI v2). While a WINAFL_CMD_GO_BATCH is in flight the
+// return hook runs the next input in place instead of parking/notifying, until all
+// BatchCount runs are done. Single-core (the target is pinned), so plain statics.
+//
+static BOOLEAN g_WinaflBatchActive = FALSE;
+static UINT32  g_WinaflBatchIndex  = 0;
+
 VOID
 WinaflHookSetSharedPage(PWINAFL_HOOK_SHARED Shared)
 {
     g_WinaflHookShared = Shared;
+}
+
+//
+// Register (RCX) input delivery: when armed with RcxDelivery, load the run's
+// 8-byte input value into RCX -- the Windows x64 first integer-argument register
+// -- just before entering the fuzzed function, so a normal C function
+// void f(uint64_t x) receives the input as x. The rest of the entry snapshot is
+// left as captured. Bounds-checked against the input table. No-op when
+// RcxDelivery is off (classic file-based input).
+//
+static VOID
+WinaflHookLoadInput(PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs, UINT32 Index)
+{
+    if (Shared->RcxDelivery && Index < WINAFL_HOOK_MAX_BATCH)
+    {
+        Regs->rcx = Shared->BatchInputs[Index];
+    }
 }
 
 //
@@ -143,8 +168,17 @@ WinaflHookArm(UINT64 SharedUserVa, UINT32 SharedSize)
 
     Shared->Status = WINAFL_STATUS_ARMED;
 
-    LogInfo("[winafl] armed: shared=0x%llx fuzz=0x%llx park=0x%llx pid=%u",
-            (UINT64)Shared, Shared->FuzzAddress, Shared->ParkStubAddress, Shared->TargetProcessId);
+    //
+    // Fresh session: clear any stale batch state left by a previous run that was
+    // torn down mid-batch (crash/hang truncation). Every GO/GO_BATCH re-inits this
+    // anyway, but reset defensively so a stray return hook can't misbehave.
+    //
+    g_WinaflBatchActive = FALSE;
+    g_WinaflBatchIndex  = 0;
+
+    LogInfo("[winafl] armed: shared=0x%llx fuzz=0x%llx park=0x%llx pid=%u rcx=%u",
+            (UINT64)Shared, Shared->FuzzAddress, Shared->ParkStubAddress,
+            Shared->TargetProcessId, Shared->RcxDelivery);
 
     //
     // Publish last: once g_WinaflHookShared is non-NULL the hooks are live.
@@ -313,6 +347,73 @@ static BOOLEAN
 WinaflHookOnReturn(PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs)
 {
     //
+    // ---- Batched run (WINAFL_CMD_GO_BATCH) ----
+    // Run BatchCount inputs back-to-back. PT stays enabled across the whole batch
+    // (the ring accumulates every run), and at each return boundary we record the
+    // CUMULATIVE PT write offset for the run that just finished. If more runs
+    // remain we DO NOT pause/park: restore the entry snapshot, load the next RCX
+    // input, and jump straight back to the fuzz entry. Only after the last run do
+    // we pause PT, park, and notify the fuzzer once (BATCH_DONE).
+    //
+    if (g_WinaflBatchActive)
+    {
+        UINT32 i = g_WinaflBatchIndex;
+
+        //
+        // PAUSE tracing on THIS core BEFORE reading the offset. Disabling TraceEn
+        // flushes PT's internally-buffered packets out to the ToPA output buffer, so
+        // the offset then reflects ALL of this run's packets. Reading it while
+        // tracing is still live returns a stale offset (the run's last packets are
+        // not yet in the buffer), which truncated each segment and bled bytes into
+        // the next one -- causing the decoder's "can't sync" errors and the low
+        // stability. It also means the inter-run gap (return hook, snapshot restore,
+        // VM transitions) is not traced into the next run's segment. Pause/resume
+        // preserve the ring offset (HyperTracePtResumeCurrentCore does not rewind
+        // MASK_PTRS), so the cumulative-offset model still holds.
+        //
+        HyperTracePtPauseCurrentCore();
+
+        if (i < WINAFL_HOOK_MAX_BATCH)
+        {
+            Shared->SegmentSize[i]   = HyperTracePtSizeCurrentCore();
+            Shared->SegmentStatus[i] = WINAFL_STATUS_ITER_DONE;
+        }
+
+        g_WinaflBatchIndex   = ++i;
+        Shared->SegmentCount = i;              // publish progress (crash/hang truncation reads this)
+        Shared->IterationCount++;
+
+        if (i < Shared->BatchCount)
+        {
+            //
+            // More runs remain: restore the snapshot, load the next input, RESUME
+            // tracing, then re-enter the fuzz entry. Resuming AFTER the register/RSP
+            // restore means only the run's own instructions are traced. The return
+            // hook is a #BP epthook, so EptCheckAndHandleBreakpoint already
+            // suppressed the RIP increment -- our VmFuncSetRip is the last writer.
+            //
+            RtlCopyMemory(Regs, &Shared->SavedRegs, sizeof(WINAFL_HOOK_REGS));
+            SetGuestRSP(Shared->SavedRsp);
+            WinaflHookLoadInput(Shared, Regs, i);
+            HyperTracePtResumeCurrentCore();
+            VmFuncSetRip(Shared->FuzzAddress);
+            return TRUE; // handled in kernel: skip the (empty) action + epilogue
+        }
+
+        //
+        // Last run of the batch: PT is already paused above; just park the guest and
+        // wake the fuzzer once.
+        //
+        g_WinaflBatchActive = FALSE;
+        Shared->Status      = WINAFL_STATUS_ITER_DONE;
+        WINAFL_KLOG("[winafl] BATCH done: %u runs (PT paused, parking)", Shared->BatchCount);
+        WinaflHookPark(Shared);
+        WinaflHookNotify(WINAFL_TAG_BATCH_DONE);
+        return TRUE; // handled in kernel
+    }
+
+    //
+    // ---- Single run (WINAFL_CMD_GO) ----
     // The iteration has returned: stop tracing immediately, on THIS (pinned) core,
     // before we rewind + park. Current-core RTIT_CTL toggle only (no DPC/log), so
     // it is valid here in VMX-root. Bracketing PT in the hooks -- not from a
@@ -359,20 +460,46 @@ WinaflHookOnParkCpuid(PROCESSOR_DEBUGGING_STATE * DbgState)
     if (Rip < Shared->ParkStubAddress || Rip >= Shared->ParkStubAddress + 0x40)
         return FALSE;
 
-    if (Shared->Command == WINAFL_CMD_GO)
+    if (Shared->Command == WINAFL_CMD_GO || Shared->Command == WINAFL_CMD_GO_BATCH)
     {
+        BOOLEAN Batch = (Shared->Command == WINAFL_CMD_GO_BATCH);
+
         //
-        // Release into the next iteration: restore the snapshotted GP registers +
-        // RSP (RSP must go through SetGuestRSP -- it is VMCS state), resume PT on
-        // this pinned core, and jump straight to the fuzz entry. The caller
-        // short-circuits the event so HvHandleCpuid does not advance RIP over our
-        // redirect.
+        // Release into the next run: restore the snapshotted GP registers + RSP (RSP
+        // must go through SetGuestRSP -- it is VMCS state), optionally load the input
+        // into RCX, resume PT on this pinned core, and jump straight to the fuzz
+        // entry. The caller short-circuits the event so HvHandleCpuid does not
+        // advance RIP over our redirect.
+        //
+        // GO_BATCH additionally arms the return-hook batch loop: it runs BatchInputs
+        // [0..BatchCount) back-to-back before parking + notifying BATCH_DONE.
         //
         Shared->Command = WINAFL_CMD_IDLE;
         RtlCopyMemory(DbgState->Regs, &Shared->SavedRegs, sizeof(WINAFL_HOOK_REGS));
         SetGuestRSP(Shared->SavedRsp);
-        WINAFL_KLOG("[winafl] park(cpuid): GO -> resume at fuzz=0x%llx (iter=%lld)",
-                    Shared->FuzzAddress, Shared->IterationCount);
+
+        if (Batch)
+        {
+            //
+            // Defence in depth: never let a bad BatchCount index past the segment
+            // tables (the user side already clamps, but this runs in VMX-root).
+            //
+            if (Shared->BatchCount > WINAFL_HOOK_MAX_BATCH)
+                Shared->BatchCount = WINAFL_HOOK_MAX_BATCH;
+
+            g_WinaflBatchActive  = TRUE;
+            g_WinaflBatchIndex   = 0;
+            Shared->SegmentCount = 0;
+        }
+        else
+        {
+            g_WinaflBatchActive = FALSE;
+        }
+
+        WinaflHookLoadInput(Shared, DbgState->Regs, 0); // run 0 uses BatchInputs[0]
+
+        WINAFL_KLOG("[winafl] park(cpuid): %s -> resume at fuzz=0x%llx (iter=%lld)",
+                    Batch ? "GO_BATCH" : "GO", Shared->FuzzAddress, Shared->IterationCount);
         HyperTracePtResumeCurrentCore();
         VmFuncSetRip(Shared->FuzzAddress);
         //

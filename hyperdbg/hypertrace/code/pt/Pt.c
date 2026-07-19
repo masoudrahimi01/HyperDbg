@@ -1378,6 +1378,18 @@ HyperTracePtResumeCurrentCore()
     PtEngineResume(&g_PtStateList[CurrentCore]);
 }
 
+//
+// VMX-root-safe, NO-LOG read of the current PT write offset on the CURRENT core.
+// Same constraints/rationale as the pause/resume current-core wrappers above: no
+// DPC broadcast, no logging. WinAFL's batched persistence loop calls this at each
+// per-run return boundary to record the cumulative PT offset for that run.
+//
+UINT64
+HyperTracePtSizeCurrentCore()
+{
+    return PtSize();
+}
+
 /**
  * @brief Snapshot the current PT output position on the CURRENT CPU
  *        without disturbing tracing state. The returned value is the

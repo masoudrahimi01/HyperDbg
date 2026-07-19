@@ -129,4 +129,4 @@
  * HyperDbg to show messages faster but you should keep in mind,
  *  not to eat all of the CPU
  */
-#define DefaultSpeedOfReadingKernelMessages 30
+#define DefaultSpeedOfReadingKernelMessages 3

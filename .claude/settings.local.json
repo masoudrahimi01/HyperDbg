@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo \"===EXIT $?===\")",
+      "Read(//c/Users/masra/Desktop/libipt/bin/**)",
+      "Read(//c/Users/masra/Desktop/libipt/lib/**)"
+    ]
+  }
+}

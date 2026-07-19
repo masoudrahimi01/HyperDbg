@@ -100,6 +100,14 @@ HyperTracePtPauseCurrentCore();
 IMPORT_EXPORT_HYPERTRACE VOID
 HyperTracePtResumeCurrentCore();
 
+//
+// Read the current PT write offset on the CURRENT core only -- VMX-root safe, no
+// DPC broadcast, no logging (same contract as the pause/resume current-core
+// wrappers). WinAFL's batched persistence loop records this per run.
+//
+IMPORT_EXPORT_HYPERTRACE UINT64
+HyperTracePtSizeCurrentCore();
+
 IMPORT_EXPORT_HYPERTRACE BOOLEAN
 HyperTracePtSize(HYPERTRACE_PT_OPERATION_PACKETS * PtOperationRequest);
 
