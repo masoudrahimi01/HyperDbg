@@ -13,6 +13,29 @@
  */
 #include "pch.h"
 
+//
+// ================= WinAFL: single-core exec-hook install scope =================
+//
+// When >= 0, EptHookCreateHookPage installs the exec (!epthook) hook's fake page
+// ONLY on this core's EPT table instead of every core. WinAFL sets this to the
+// target's pinned core so that hooking a SHARED-code function (e.g. ntdll
+// RtlAllocateHeap for the guard-page sanitizer) does not turn every process's call
+// on every core into a VM-exit -- which otherwise floods the box (each heap alloc
+// system-wide = 2 exits) and makes the whole machine unresponsive. The target runs
+// only on its pinned core, so hooking that one core catches all of its calls while
+// leaving the other cores' EPT (and therefore every other process) untouched.
+// EptHookPerformHook already broadcasts an EPT TLB invalidation to all cores after
+// install, so the pinned core's stale (real-page) translation is flushed correctly.
+// -1 = default (hook all cores, unchanged behaviour for non-WinAFL callers).
+//
+volatile LONG g_EptHookForceSingleCore = -1;
+
+VOID
+EptHookSetForceSingleCore(INT32 CoreId)
+{
+    g_EptHookForceSingleCore = CoreId;
+}
+
 /**
  * @brief Check whether the desired PhysicalAddress is already in the g_EptState->HookedPagesList hooks or not
  *
@@ -272,9 +295,25 @@ EptHookCreateHookPage(_Inout_ VIRTUAL_MACHINE_STATE * VCpu,
     SwitchToPreviousProcess(Cr3OfCurrentProcess);
 
     //
-    // Split the 2MB page-table of each core to 4KB page-table
+    // Split the 2MB page-table of each core to 4KB page-table.
     //
-    for (SIZE_T i = 0; i < ProcessorsCount; i++)
+    // WinAFL single-core scoping: when g_EptHookForceSingleCore >= 0 we install the
+    // hook on ONLY that core's EPT (see the note at the top of this file). This
+    // keeps hooking a shared-code function (ntdll allocators) from trapping every
+    // process on every core. The per-page bookkeeping that used to run on i==0 now
+    // runs on the first (only) core we touch.
+    //
+    SIZE_T LoopStart = 0;
+    SIZE_T LoopEnd   = ProcessorsCount;
+    LONG   ForceCore = g_EptHookForceSingleCore;
+
+    if (ForceCore >= 0 && (ULONG)ForceCore < ProcessorsCount)
+    {
+        LoopStart = (SIZE_T)ForceCore;
+        LoopEnd   = (SIZE_T)ForceCore + 1;
+    }
+
+    for (SIZE_T i = LoopStart; i < LoopEnd; i++)
     {
         //
         // We need to split the large page to 4KB page using pre-allocated pools
@@ -340,9 +379,10 @@ EptHookCreateHookPage(_Inout_ VIRTUAL_MACHINE_STATE * VCpu,
         // Only for the first time execution of the loop, we save these details,
         // it is because after this condition, the hook is applied and by applying
         // the hook, we have to make sure that the address is saved g_EptState->HookedPagesList
-        // because the hook might be simultaneously triggered from other cores
+        // because the hook might be simultaneously triggered from other cores.
+        // (LoopStart, not 0, so a single-core install still records the bookkeeping.)
         //
-        if (i == 0)
+        if (i == LoopStart)
         {
             //
             // Save the modified entry

@@ -435,6 +435,56 @@ VmFuncSetRip(UINT64 Rip)
 }
 
 /**
+ * @brief WinAFL guard-page sanitizer: force a guest-physical page to no-access on
+ * the current core's EPT (saving the original PML1 entry for a later restore).
+ * @details Thin export over EptGuardProtectPage(); VMX-root only.
+ *
+ * @param CoreId
+ * @param PhysicalAddress
+ * @param OriginalEntry
+ *
+ * @return BOOLEAN
+ */
+BOOLEAN
+VmFuncEptGuardProtectPage(UINT32 CoreId, UINT64 PhysicalAddress, UINT64 * OriginalEntry)
+{
+    return EptGuardProtectPage(CoreId, PhysicalAddress, OriginalEntry);
+}
+
+/**
+ * @brief WinAFL guard-page sanitizer: restore a page guarded by
+ * VmFuncEptGuardProtectPage() using the saved original PML1 entry.
+ * @details Thin export over EptGuardRestorePage(); VMX-root only.
+ *
+ * @param CoreId
+ * @param PhysicalAddress
+ * @param OriginalEntry
+ *
+ * @return VOID
+ */
+VOID
+VmFuncEptGuardRestorePage(UINT32 CoreId, UINT64 PhysicalAddress, UINT64 OriginalEntry)
+{
+    EptGuardRestorePage(CoreId, PhysicalAddress, OriginalEntry);
+}
+
+/**
+ * @brief WinAFL: restrict subsequent exec (!epthook) installs to one core's EPT
+ * (the target's pinned core), or -1 for all cores. Thin export over
+ * EptHookSetForceSingleCore(); avoids a system-wide VM-exit flood when hooking a
+ * shared-code function such as an ntdll allocator.
+ *
+ * @param CoreId
+ *
+ * @return VOID
+ */
+VOID
+VmFuncEptHookSetForceSingleCore(INT32 CoreId)
+{
+    EptHookSetForceSingleCore(CoreId);
+}
+
+/**
  * @brief Get the guest state of IA32_DEBUGCTL
  *
  * @return UINT64

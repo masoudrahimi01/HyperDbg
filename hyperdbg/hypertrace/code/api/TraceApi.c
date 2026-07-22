@@ -56,6 +56,27 @@ HyperTraceInitCallback(HYPERTRACE_CALLBACKS * HyperTraceCallbacks,
     g_LbrStateList = (LBR_STACK_ENTRY *)PlatformMemAllocateZeroedNonPagedPool(sizeof(LBR_STACK_ENTRY) * ProcessorsCount);
 
     //
+    // Restrict Processor Trace to a single core.
+    //
+    // PT output buffers are physically contiguous, non-paged, and allocated PER
+    // CORE, so the ring size multiplies by the processor count: a 16 MB ring on a
+    // 20-core machine is 320 MB of contiguous non-paged memory. A fuzz target
+    // pinned to one core only ever writes to that core's ring, so the rest is pure
+    // waste -- and it is the reason the ring could not be made large.
+    //
+    // With this set, every per-core PT operation no-ops on any core other than
+    // g_PtFuzzCoreId (see PtCoreParticipates in Pt.c), and no buffers are
+    // allocated or mapped for them.
+    //
+    // g_PtFuzzCoreId MUST match the core the target is pinned to -- WinAFL pins to
+    // core 0 (pinned_core) and reads that core's ring, so 0 is the value that goes
+    // with it. Set both here, before any buffers exist; changing them once PT is
+    // enabled would strand the other cores' allocations.
+    //
+    g_PtSingleCoreOnly = TRUE;
+    g_PtFuzzCoreId     = 0;
+
+    //
     // Initialize the global PT per-CPU state list. Each entry starts in
     // PT_STATE_DISABLED with no buffers allocated; PtStart() will lazily
     // allocate ToPA / output / overflow buffers on first use per core.

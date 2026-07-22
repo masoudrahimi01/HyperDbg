@@ -977,9 +977,15 @@ AttachingCheckUnhandledEptViolation(UINT32 CoreId,
                                     UINT64 ViolationQualification,
                                     UINT64 GuestPhysicalAddr)
 {
-    UNREFERENCED_PARAMETER(CoreId);
-    UNREFERENCED_PARAMETER(ViolationQualification);
-    UNREFERENCED_PARAMETER(GuestPhysicalAddr);
+    //
+    // WinAFL guard-page sanitizer: if this violation is on one of our no-access
+    // guard/held pages, classify it (heap overflow / use-after-free), report it to
+    // the fuzzer as a crash for the current input, and consider it handled.
+    //
+    if (WinaflSanHandleEptViolation(CoreId, ViolationQualification, GuestPhysicalAddr))
+    {
+        return TRUE;
+    }
 
     //
     // Not handled here

@@ -252,6 +252,15 @@ WinaflHookArm(UINT64 SharedUserVa, UINT32 SharedSize);
 VOID
 WinaflHookDisarm();
 
+//
+// WinAFL EPT guard-page sanitizer classifier. Called from the unhandled-EPT-
+// violation seam (AttachingCheckUnhandledEptViolation) in VMX-root on the faulting
+// core: if the violation is on one of our no-access guard/held pages it reports a
+// crash to the fuzzer (overflow / use-after-free) and returns TRUE (handled).
+//
+BOOLEAN
+WinaflSanHandleEptViolation(UINT32 CoreId, UINT64 ViolationQualification, UINT64 GuestPhysicalAddr);
+
 PDEBUGGER_EVENT
 DebuggerGetEventByTag(UINT64 Tag);
 

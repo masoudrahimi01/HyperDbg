@@ -190,6 +190,17 @@ EptHookInlineHookFromVmxRoot(VIRTUAL_MACHINE_STATE * VCpu,
                              PVOID                   HookFunction);
 
 /**
+ * @brief WinAFL: restrict the next exec (!epthook) installs to a single core's EPT
+ * (the fuzz target's pinned core), or -1 to hook all cores (default). Used to avoid
+ * turning a shared-code hook (ntdll allocators) into a system-wide VM-exit flood.
+ *
+ * @param CoreId the core to hook, or -1 for all cores
+ * @return VOID
+ */
+VOID
+EptHookSetForceSingleCore(INT32 CoreId);
+
+/**
  * @brief This function applies EPT monitor hooks to the target EPT table
  * @details this function should be called from VMX root-mode
  *

@@ -40,8 +40,19 @@
 // v2: added register (RCX) input delivery + batched multi-run execution
 //     (RcxDelivery / BatchCount / BatchInputs[] and the GO_BATCH command /
 //     BATCH_DONE tag / NOTRUN status).
+// v3: added the EPT guard-page sanitizer (heap-overflow + use-after-free
+//     detection). New SanitizeFlags / SanAllocatorCount / PostStubAddress /
+//     SanAllocators[] configuration and the SanFault* result block. A batch run
+//     whose input trips a guard page (overflow) or touches a held freed buffer
+//     (UAF) is reported to the fuzzer as an ordinary WINAFL_TAG_CRASH, attributed
+//     to the offending input index, with the classification in SanFault*.
+// v4: added WINAFL_SAN_ALLOCATOR.FlagsReg / ZeroFlag so the pre-hook can force a
+//     zero-init flag (HEAP_ZERO_MEMORY) into the allocator. That makes the whole
+//     enlarged chunk -- including the guard page in the redzone -- present, so the
+//     guard page can actually be protected (otherwise a non-zeroed allocation
+//     leaves the redzone un-faulted-in and overflow detection silently fails).
 //
-#define WINAFL_HOOK_ABI_VERSION 2
+#define WINAFL_HOOK_ABI_VERSION 4
 
 //
 // Maximum fuzzed-function arguments we snapshot/restore at the prologue.
@@ -63,6 +74,43 @@
 // output tables (below) are indexed by batch position.
 //
 #define WINAFL_HOOK_MAX_BATCH 100
+
+//
+// ---- EPT guard-page sanitizer (ABI v3) ----
+//
+// Maximum allocator functions the fuzzer may register for guard-page
+// instrumentation (RtlAllocateHeap/RtlFreeHeap, ExAllocatePool*/ExFreePool*, ...).
+//
+#define WINAFL_SAN_MAX_ALLOCATORS 8
+
+//
+// Sanitizer master flags (WINAFL_HOOK_SHARED.SanitizeFlags). Zero => the whole
+// sanitizer is inert (no allocator hooks are registered by the fuzzer, so the VMM
+// never sees the extra hits).
+//
+#define WINAFL_SAN_OVERFLOW 0x1 // guard-page heap-overflow detection
+#define WINAFL_SAN_UAF      0x2 // use-after-free detection (hold freed pages)
+
+//
+// Guard-page over-allocation, in bytes. The pre-hook adds this to the requested
+// size; the post-hook then repositions the caller's buffer so its last byte ends
+// exactly on a page boundary with a dedicated no-access guard page immediately
+// after it, AND so the buffer's first page is fully owned by this allocation (no
+// bleed into the previous heap chunk). The placement is
+//     GuardVa = PAGE_UP(RealBase) + PAGE_UP(OrigSize)
+//     UserPtr = GuardVa - OrigSize
+// whose worst-case span is OrigSize + 3 pages: up to one page of front slack
+// (PAGE_UP(RealBase) - RealBase) + up to one page of tail rounding
+// (PAGE_UP(OrigSize) - OrigSize) + one guard page. See the guard math in the VMM.
+//
+#define WINAFL_SAN_REDZONE 0x3000
+
+//
+// Synthetic exception vector stamped into WINAFL_HOOK_SHARED.FaultVector for a
+// sanitizer-detected crash, so the fuzzer can tell it apart from a real fault.
+// The precise overflow-vs-UAF classification is in SanFaultKind.
+//
+#define WINAFL_SAN_FAULT_VECTOR 0x5A
 
 //////////////////////////////////////////////////
 //                    Enums                     //
@@ -116,9 +164,81 @@ typedef enum _WINAFL_HOOK_TAG
 
 } WINAFL_HOOK_TAG;
 
+/**
+ * @brief Which x64 integer-argument register carries the size (for an allocator)
+ *        or the pointer (for a free). Only used to read/patch the right register
+ *        in the VMX-root pre-hook; the numeric values are private to this ABI.
+ */
+typedef enum _WINAFL_SAN_REG
+{
+    WINAFL_SAN_REG_NONE = 0,
+    WINAFL_SAN_REG_RCX  = 1,
+    WINAFL_SAN_REG_RDX  = 2,
+    WINAFL_SAN_REG_R8   = 3,
+    WINAFL_SAN_REG_R9   = 4,
+
+} WINAFL_SAN_REG;
+
+/**
+ * @brief Role of a hooked allocator function.
+ */
+typedef enum _WINAFL_SAN_FN_KIND
+{
+    WINAFL_SAN_FN_NONE  = 0,
+    WINAFL_SAN_FN_ALLOC = 1, // pre: enlarge the size register; post (via the return
+                             //      stub): capture RAX and reposition the buffer
+    WINAFL_SAN_FN_FREE  = 2, // pre: look up the pointer register, hold + protect the
+                             //      buffer's pages, and skip the real free
+
+} WINAFL_SAN_FN_KIND;
+
+/**
+ * @brief Sanitizer fault classification (WINAFL_HOOK_SHARED.SanFaultKind).
+ */
+typedef enum _WINAFL_SAN_FAULT
+{
+    WINAFL_SAN_FAULT_NONE        = 0,
+    WINAFL_SAN_FAULT_OVERFLOW    = 1, // access crossed into a guard page
+    WINAFL_SAN_FAULT_UAF         = 2, // access to a freed (still-held) buffer
+    WINAFL_SAN_FAULT_DOUBLE_FREE = 3, // free() of a buffer already held as freed.
+                                      // Detected in the free hook (not via an EPT
+                                      // violation), so it never appears as a page
+                                      // Kind -- only in SanFaultKind.
+
+} WINAFL_SAN_FAULT;
+
 //////////////////////////////////////////////////
 //                  Structures                  //
 //////////////////////////////////////////////////
+
+/**
+ * @brief One hooked allocator function. The fuzzer resolves the entry VA in the
+ *        target and fills the register roles per that function's calling
+ *        convention. Examples (Windows x64):
+ *          RtlAllocateHeap(Heap, Flags, Size@R8)   -> ALLOC, ArgReg=R8
+ *          RtlFreeHeap(Heap, Flags, Base@R8)        -> FREE,  ArgReg=R8, RetIsBool=1
+ *          ExAllocatePoolWithTag(Type, Size@RDX)    -> ALLOC, ArgReg=RDX
+ *          ExAllocatePool2(Flags, Size@RDX)         -> ALLOC, ArgReg=RDX
+ *          ExFreePoolWithTag(P@RCX, Tag)            -> FREE,  ArgReg=RCX
+ *          ExFreePool(P@RCX)                         -> FREE,  ArgReg=RCX
+ */
+typedef struct _WINAFL_SAN_ALLOCATOR
+{
+    UINT64 Address;   // [F->K] entry VA (0 => unused slot)
+    UINT32 Kind;      // [F->K] WINAFL_SAN_FN_KIND
+    UINT32 ArgReg;    // [F->K] WINAFL_SAN_REG: size (ALLOC) or pointer (FREE)
+    UINT32 RetIsBool; // [F->K] FREE only: 1 => emulate a BOOLEAN(TRUE) return in RAX
+    UINT32 FlagsReg;  // [F->K] ALLOC only: WINAFL_SAN_REG holding the alloc flags, or
+                      //        WINAFL_SAN_REG_NONE. The pre-hook ORs ZeroFlag into it.
+    UINT64 ZeroFlag;  // [F->K] ALLOC only: flag bit(s) to force zero-initialisation
+                      //        (e.g. HEAP_ZERO_MEMORY=0x8 in RtlAllocateHeap's RDX).
+                      //        Zeroing the ENLARGED size touches the whole chunk so the
+                      //        guard page in the redzone is present and can be
+                      //        protected; without it a non-zeroed allocation leaves the
+                      //        redzone un-faulted-in and overflow detection silently
+                      //        fails. 0 => do not touch the flags register.
+
+} WINAFL_SAN_ALLOCATOR;
 
 /**
  * @brief Plain mirror of GUEST_REGS (rax..r15). Same field order and size as
@@ -239,6 +359,31 @@ typedef struct _WINAFL_HOOK_SHARED
     UINT32 RcxDelivery;                      // [F->K] 1 => deliver input via RCX
     UINT32 BatchCount;                       // [F->K] runs in this GO_BATCH (<= MAX_BATCH)
     UINT64 BatchInputs[WINAFL_HOOK_MAX_BATCH]; // [F->K] per-run RCX values
+
+    //
+    // ---- EPT guard-page sanitizer (ABI v3) ----
+    // Heap-overflow + use-after-free detection via EPT no-access guard pages.
+    // Entirely inert when SanitizeFlags == 0 (the fuzzer then registers no
+    // allocator hooks, so the VMM never runs any of this code). See the guard math
+    // and lifecycle in the VMM (WinaflSan* in hyperkd Debugger.c).
+    //
+    UINT32               SanitizeFlags;     // [F->K] WINAFL_SAN_* bits; 0 = disabled
+    UINT32               SanAllocatorCount; // [F->K] valid entries in SanAllocators[]
+    UINT64               PostStubAddress;   // [F->K] return-trampoline stub VA (guest);
+                                            //        exec-hooked, used to capture RAX at
+                                            //        allocator return without a per-call hook
+    WINAFL_SAN_ALLOCATOR SanAllocators[WINAFL_SAN_MAX_ALLOCATORS]; // [F->K]
+
+    //
+    // Filled by the EPT-violation classifier when a guard-page / UAF fault is
+    // reported to the fuzzer as a crash (the generic Fault* block above is filled
+    // too: FaultVector = WINAFL_SAN_FAULT_VECTOR, FaultRip = faulting RIP).
+    //
+    UINT32 SanFaultKind;       // [K->F] WINAFL_SAN_FAULT
+    UINT32 SanFaultInputIndex; // [K->F] batch index blamed for the fault
+    UINT64 SanFaultAllocBase;  // [K->F] user pointer of the offending allocation
+    UINT64 SanFaultAccessVa;   // [K->F] faulting linear address (0 if unavailable)
+    UINT64 SanFaultAllocSize;  // [K->F] original requested size of that allocation
 
 } WINAFL_HOOK_SHARED, *PWINAFL_HOOK_SHARED;
 

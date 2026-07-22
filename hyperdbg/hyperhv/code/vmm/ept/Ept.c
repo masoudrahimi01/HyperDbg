@@ -1325,3 +1325,112 @@ EptCheckAndHandleBreakpoint(VIRTUAL_MACHINE_STATE * VCpu)
 
     return IsHandledByEptHook;
 }
+
+//
+// ===================== WinAFL EPT guard-page sanitizer ======================
+//
+// Low-level EPT permission flip for the WinAFL guard-page sanitizer. These are
+// deliberately STATELESS: the caller (hyperkd's WinaflSan* logic) owns all the
+// allocation/guard metadata and hands us back the saved original entry to restore.
+// We only split the containing 2MB page to 4KB (if needed) and force one 4KB page
+// to no-access (all of R/W/X clear => the leaf entry is "not present" => any guest
+// access raises an EPT violation, which the sanitizer classifies as overflow/UAF).
+//
+// Only the CURRENT core's EPT table is touched: the fuzz target is pinned to a
+// single core, so the guarded, process-private physical pages are only ever
+// accessed from that core. Leaving the other cores' EPT untouched means an
+// unrelated kernel access to the same physical frame on another core does NOT
+// spuriously fault (and cannot be misattributed to a fuzz input).
+//
+
+/**
+ * @brief Force a guest-physical page to no-access on the current core's EPT.
+ * @details VMX-root only. Splits the 2MB large page to 4KB using pre-allocated
+ * pools (safe in root) if not already split, saves the original PML1 entry into
+ * *OriginalEntry for a later EptGuardRestorePage(), then clears R/W/X and
+ * invalidates the EPT TLB for this core's context.
+ *
+ * @param CoreId          the current core (the pinned target's core)
+ * @param PhysicalAddress any address within the target page (need not be aligned)
+ * @param OriginalEntry   out: the pre-change PML1 entry (pass back to restore)
+ *
+ * @return BOOLEAN TRUE on success; FALSE if the split failed or the PML1 entry
+ *                 could not be resolved (caller should then not guard this page).
+ */
+BOOLEAN
+EptGuardProtectPage(UINT32 CoreId, UINT64 PhysicalAddress, UINT64 * OriginalEntry)
+{
+    UINT64                  Pa   = PhysicalAddress & ~((UINT64)PAGE_SIZE - 1);
+    VIRTUAL_MACHINE_STATE * VCpu = &g_GuestState[CoreId];
+    PEPT_PML1_ENTRY         Pml1;
+    EPT_PML1_ENTRY          Denied;
+
+    if (Pa == 0)
+    {
+        return FALSE;
+    }
+
+    //
+    // Ensure the region is 4KB-granular so we can deny exactly one page. Uses the
+    // pre-allocated split pools (the only allocation source valid in VMX-root);
+    // idempotent if the 2MB page is already split.
+    //
+    if (!EptSplitLargePage(VCpu->EptPageTable, TRUE, Pa))
+    {
+        return FALSE;
+    }
+
+    Pml1 = EptGetPml1Entry(VCpu->EptPageTable, Pa);
+    if (!Pml1)
+    {
+        return FALSE;
+    }
+
+    if (OriginalEntry != NULL)
+    {
+        *OriginalEntry = Pml1->AsUInt;
+    }
+
+    //
+    // No-access: R=W=X=0. An EPT leaf with all access bits clear is treated as
+    // "not present" -> EPT violation (NOT misconfiguration) on any access. The
+    // memory type / page frame number are left intact so the restore is exact.
+    //
+    Denied.AsUInt        = Pml1->AsUInt;
+    Denied.ReadAccess    = 0;
+    Denied.WriteAccess   = 0;
+    Denied.ExecuteAccess = 0;
+
+    EptSetPML1AndInvalidateTLB(VCpu, Pml1, Denied, InveptSingleContext);
+
+    return TRUE;
+}
+
+/**
+ * @brief Restore a page previously guarded by EptGuardProtectPage().
+ * @details VMX-root only. Writes the saved original PML1 entry back and
+ * invalidates the EPT TLB. Safe to call for a page whose 2MB parent was split
+ * (the split is never merged back, which is harmless).
+ *
+ * @param CoreId          the current core
+ * @param PhysicalAddress any address within the page to restore
+ * @param OriginalEntry   the value captured by EptGuardProtectPage()
+ *
+ * @return VOID
+ */
+VOID
+EptGuardRestorePage(UINT32 CoreId, UINT64 PhysicalAddress, UINT64 OriginalEntry)
+{
+    UINT64                  Pa   = PhysicalAddress & ~((UINT64)PAGE_SIZE - 1);
+    VIRTUAL_MACHINE_STATE * VCpu = &g_GuestState[CoreId];
+    PEPT_PML1_ENTRY         Pml1 = EptGetPml1Entry(VCpu->EptPageTable, Pa);
+    EPT_PML1_ENTRY          Restored;
+
+    if (!Pml1)
+    {
+        return;
+    }
+
+    Restored.AsUInt = OriginalEntry;
+    EptSetPML1AndInvalidateTLB(VCpu, Pml1, Restored, InveptSingleContext);
+}

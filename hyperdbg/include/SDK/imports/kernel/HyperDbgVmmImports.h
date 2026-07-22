@@ -420,6 +420,15 @@ ConfigureEptHookUnHookSingleAddressFromVmxRoot(UINT64                           
                                                UINT64                              PhysAddress,
                                                EPT_SINGLE_HOOK_UNHOOKING_DETAILS * TargetUnhookingDetails);
 
+IMPORT_EXPORT_VMM BOOLEAN
+VmFuncEptGuardProtectPage(UINT32 CoreId, UINT64 PhysicalAddress, UINT64 * OriginalEntry);
+
+IMPORT_EXPORT_VMM VOID
+VmFuncEptGuardRestorePage(UINT32 CoreId, UINT64 PhysicalAddress, UINT64 OriginalEntry);
+
+IMPORT_EXPORT_VMM VOID
+VmFuncEptHookSetForceSingleCore(INT32 CoreId);
+
 IMPORT_EXPORT_VMM VOID
 ConfigureEptHookAllocateExtraHookingPagesForMemoryMonitorsAndExecEptHooks(UINT32 Count);
 

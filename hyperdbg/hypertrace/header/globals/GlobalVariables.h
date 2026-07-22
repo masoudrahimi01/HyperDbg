@@ -84,6 +84,31 @@ BOOLEAN g_ProcessorTraceEnabled;
 PT_PER_CPU * g_PtStateList;
 
 /**
+ * @brief When TRUE, ONLY g_PtFuzzCoreId takes part in Processor Trace: every
+ *        per-core PT operation becomes a no-op on any other core, and no PT
+ *        buffers are allocated or mapped for them.
+ *
+ *        The point is memory. PT buffers are physically contiguous, non-paged,
+ *        and per core, so a 16 MB ring on a 20-core box costs 320 MB of
+ *        contiguous non-paged memory even though a pinned fuzzing target only
+ *        ever writes to one core's ring. Restricting PT to the fuzz core makes a
+ *        large ring affordable.
+ *
+ *        Set at hypertrace init (TraceApi.c). Only meaningful while PT is
+ *        disabled: flipping it with buffers already allocated would leave the
+ *        other cores' buffers allocated but unmanaged, so change it and then
+ *        re-enable PT.
+ */
+BOOLEAN g_PtSingleCoreOnly;
+
+/**
+ * @brief The core that PT runs on when g_PtSingleCoreOnly is set. Must match the
+ *        core the fuzz target is pinned to (WinAFL pins to core 0 and reads that
+ *        core's ring, so this is 0).
+ */
+UINT32 g_PtFuzzCoreId;
+
+/**
  * @brief Per-CPU MDL + user-mode VA for the PT mmap surface (main
  *        output buffer concatenated with the 4 KB overflow page in a
  *        single contiguous user mapping). Populated by

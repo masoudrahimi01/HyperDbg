@@ -306,3 +306,27 @@ EptSetPML1AndInvalidateTLB(_Inout_ VIRTUAL_MACHINE_STATE *      VCpu,
  */
 BOOLEAN
 EptCheckAndHandleBreakpoint(VIRTUAL_MACHINE_STATE * VCpu);
+
+/**
+ * @brief WinAFL guard-page sanitizer: force a guest-physical page to no-access on
+ * the current core's EPT (split to 4KB if needed). Saves the original PML1 entry.
+ *
+ * @param CoreId
+ * @param PhysicalAddress
+ * @param OriginalEntry
+ * @return BOOLEAN
+ */
+BOOLEAN
+EptGuardProtectPage(UINT32 CoreId, UINT64 PhysicalAddress, UINT64 * OriginalEntry);
+
+/**
+ * @brief WinAFL guard-page sanitizer: restore a page guarded by
+ * EptGuardProtectPage() using the saved original PML1 entry.
+ *
+ * @param CoreId
+ * @param PhysicalAddress
+ * @param OriginalEntry
+ * @return VOID
+ */
+VOID
+EptGuardRestorePage(UINT32 CoreId, UINT64 PhysicalAddress, UINT64 OriginalEntry);

@@ -1062,6 +1062,26 @@ PtCheck()
 }
 
 /**
+ * @brief Does this core take part in Processor Trace at all?
+ *
+ *        Every per-core PT operation funnels through one of the PtXxx() wrappers
+ *        below, and each of them asks this first. When g_PtSingleCoreOnly is set,
+ *        only g_PtFuzzCoreId answers TRUE: everyone else allocates nothing, maps
+ *        nothing, and no-ops every start/stop/pause/resume/filter.
+ *
+ *        See g_PtSingleCoreOnly in GlobalVariables.h for why (per-core contiguous
+ *        non-paged buffers make a large ring unaffordable across 20 cores).
+ *
+ * @param CoreId  logical processor number
+ * @return BOOLEAN TRUE if PT should run on this core.
+ */
+static BOOLEAN
+PtCoreParticipates(UINT32 CoreId)
+{
+    return (!g_PtSingleCoreOnly) || (CoreId == g_PtFuzzCoreId);
+}
+
+/**
  * @brief Allocate ToPA / output / overflow buffers for every active CPU.
  *
  *        Must be called at IRQL == PASSIVE_LEVEL (before broadcasting the
@@ -1069,9 +1089,13 @@ PtCheck()
  *        is paged.
  *
  *        Idempotent: cores that already have buffers (State != DISABLED)
- *        are skipped.
+ *        are skipped. Cores excluded by PtCoreParticipates() are skipped too
+ *        and simply stay PT_STATE_DISABLED with NULL buffers -- which every
+ *        other path already treats as "nothing to do" (PtEngineFreeBuffers is
+ *        NULL-safe, PtSize returns 0 for a DISABLED core).
  *
- * @return BOOLEAN  TRUE if every core ended up with a usable buffer set.
+ * @return BOOLEAN  TRUE if every participating core ended up with a usable
+ *                  buffer set.
  */
 BOOLEAN
 PtAllocateAllCpuBuffers()
@@ -1088,6 +1112,9 @@ PtAllocateAllCpuBuffers()
     {
         PT_PER_CPU *    Cpu = &g_PtStateList[i];
         PT_TRACE_CONFIG Cfg = Cpu->Config;
+
+        if (!PtCoreParticipates(i))
+            continue; // excluded core: no buffers, stays PT_STATE_DISABLED
 
         if (Cpu->State != PT_STATE_DISABLED)
             continue;
@@ -1168,6 +1195,15 @@ PtMmapAllCpuBuffersToUser(PT_USER_BUFFER_DESC * OutDescs, UINT32 MaxDescs, UINT3
         {
             PT_PER_CPU * Cpu = &g_PtStateList[i];
 
+            //
+            // Excluded cores never got buffers, so there is nothing to map. This
+            // check has to come FIRST: the NULL test below treats a missing buffer
+            // as a hard failure and rolls the whole mapping back, which would make
+            // the mmap IOCTL fail outright the moment PT is restricted to one core.
+            //
+            if (!PtCoreParticipates(i))
+                continue;
+
             if (Cpu->Buffer.OutputVa == NULL || Cpu->Buffer.OverflowVa == NULL)
             {
                 PtUnmapAllCpuBuffersFromUser();
@@ -1194,6 +1230,19 @@ PtMmapAllCpuBuffersToUser(PT_USER_BUFFER_DESC * OutDescs, UINT32 MaxDescs, UINT3
     {
         OutDescs[i].CpuId    = i;
         OutDescs[i].Reserved = 0;
+
+        if (!PtCoreParticipates(i))
+        {
+            //
+            // Excluded core: report an explicitly empty descriptor. Size must be 0
+            // and not PT_OVERFLOW_SIZE -- there is no mapping behind it, and a
+            // caller that sized a read off it would walk into nothing.
+            //
+            OutDescs[i].UserVa = 0;
+            OutDescs[i].Size   = 0;
+            continue;
+        }
+
         OutDescs[i].UserVa   = (UINT64)(ULONG_PTR)g_PtUserMappings[i].UserVa;
         OutDescs[i].Size     = g_PtStateList[i].Buffer.OutputSize + PT_OVERFLOW_SIZE;
     }
@@ -1252,6 +1301,13 @@ PtStart()
     CurrentCore = KeGetCurrentProcessorNumberEx(NULL);
     Cpu         = &g_PtStateList[CurrentCore];
 
+    //
+    // Excluded core: nothing to start. Report SUCCESS -- this is the expected
+    // state, not a failure, and the enable path treats FALSE as a real error.
+    //
+    if (!PtCoreParticipates(CurrentCore))
+        return TRUE;
+
     if (Cpu->State == PT_STATE_DISABLED)
     {
         //
@@ -1289,6 +1345,9 @@ PtStop()
     CurrentCore = KeGetCurrentProcessorNumberEx(NULL);
     Cpu         = &g_PtStateList[CurrentCore];
 
+    if (!PtCoreParticipates(CurrentCore))
+        return;
+
     LogInfo("PT: stopping trace on core %d\n", CurrentCore);
 
     PtEngineStop(Cpu, NULL);
@@ -1310,6 +1369,9 @@ PtPause()
     CurrentCore = KeGetCurrentProcessorNumberEx(NULL);
     Cpu         = &g_PtStateList[CurrentCore];
 
+    if (!PtCoreParticipates(CurrentCore))
+        return;
+
     LogInfo("PT: pausing trace on core %u\n", CurrentCore);
 
     PtEnginePause(Cpu);
@@ -1329,6 +1391,9 @@ PtResume()
 
     CurrentCore = KeGetCurrentProcessorNumberEx(NULL);
     Cpu         = &g_PtStateList[CurrentCore];
+
+    if (!PtCoreParticipates(CurrentCore))
+        return;
 
     LogInfo("PT: resuming trace on core %u\n", CurrentCore);
 
@@ -1354,6 +1419,10 @@ HyperTracePtPauseCurrentCore()
         return;
 
     CurrentCore = KeGetCurrentProcessorNumberEx(NULL);
+
+    if (!PtCoreParticipates(CurrentCore))
+        return;
+
     PtEnginePause(&g_PtStateList[CurrentCore]);
 }
 
@@ -1375,6 +1444,10 @@ HyperTracePtResumeCurrentCore()
     // toggle only, which is proven stable over thousands of iterations.
     //
     CurrentCore = KeGetCurrentProcessorNumberEx(NULL);
+
+    if (!PtCoreParticipates(CurrentCore))
+        return;
+
     PtEngineResume(&g_PtStateList[CurrentCore]);
 }
 
@@ -1411,6 +1484,15 @@ PtSize()
 
     CurrentCore = KeGetCurrentProcessorNumberEx(NULL);
     Cpu         = &g_PtStateList[CurrentCore];
+
+    //
+    // Excluded core: no buffer, and its RTIT MSRs were never programmed, so the
+    // MASK_PTRS read below would be meaningless. (The State check underneath
+    // already catches this, since an excluded core stays PT_STATE_DISABLED --
+    // this is just explicit about why.)
+    //
+    if (!PtCoreParticipates(CurrentCore))
+        return 0;
 
     if (Cpu->State != PT_STATE_TRACING && Cpu->State != PT_STATE_PAUSED && Cpu->State != PT_STATE_STOPPED)
         return 0;
@@ -1496,6 +1578,13 @@ PtFilter(const PT_FILTER_OPTIONS * FilterOptions)
     CurrentCore = KeGetCurrentProcessorNumberEx(NULL);
     Cpu         = &g_PtStateList[CurrentCore];
 
+    //
+    // Excluded core: leave its config untouched. Re-arming RTIT_CTL here would
+    // start tracing on a core that has no output buffer.
+    //
+    if (!PtCoreParticipates(CurrentCore))
+        return;
+
     LogInfo("PT: applying filter on core %u\n", CurrentCore);
 
     //
@@ -1579,6 +1668,9 @@ PtFlush()
 
     CurrentCore = KeGetCurrentProcessorNumberEx(NULL);
     Cpu         = &g_PtStateList[CurrentCore];
+
+    if (!PtCoreParticipates(CurrentCore))
+        return;
 
     LogInfo("PT: flush on core %u\n", CurrentCore);
 

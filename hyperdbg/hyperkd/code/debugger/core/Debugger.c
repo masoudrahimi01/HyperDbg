@@ -39,20 +39,57 @@
 //
 
 //
-// Per-iteration kernel logging is OFF by default. These hooks run in VMX-root on
-// EVERY fuzz iteration; emitting several LogInfo lines + a guest-stack read each
-// time floods HyperDbg's VMX-root log path at full fuzzing speed (there is no
-// IOCTL backpressure once PT is bracketed in the kernel), which bug-checks the box
-// after a few hundred iterations. Set WINAFL_HOOK_KERNEL_VERBOSE to 1 (and rebuild
-// hyperkd) ONLY for bring-up, paired with the user-side HOOK_DEBUG_LOGS=1 so the
-// lines are actually printed. WINAFL_KLOG compiles to nothing when disabled.
+// ============================ WinAFL kernel logging ============================
 //
+// All WinAFL hook + sanitizer diagnostics are compile-gated by the two switches
+// below, so production / speed runs carry ZERO logging cost. These hooks run in
+// VMX-root on the hot path (every fuzz iteration, every guest allocation) where
+// there is no IOCTL backpressure on HyperDbg's log path -- an unbounded LogInfo here
+// floods that path and bug-checks the box after a few hundred hits. Flip a switch to
+// 1 and rebuild hyperkd ONLY for bring-up (pair with the user-side HOOK_DEBUG_LOGS=1
+// so the lines are actually printed). Each compiles to nothing when its switch is 0.
+//
+//   WINAFL_HOOK_KERNEL_VERBOSE -> WINAFL_KLOG("[winafl] ...")
+//       Persistence hooks: arm, per-run entry/return tracing, state dumps. Chatty.
+//
+//   WINAFL_SAN_KERNEL_VERBOSE  -> WINAFL_SAN_KLOG(cat, "[san] ...")
+//       EPT guard-page sanitizer: alloc/free, guard placement, faults. Each line is
+//       RATE-LIMITED to the first WINAFL_SAN_LOG_LIMIT lines of its category, so a
+//       run emits a bounded burst then goes quiet. (The rate-limiter machinery lives
+//       next to the sanitizer state further down; only the knobs live here.)
+//
+// WINAFL_HOOK_KERNEL_VERBOSE is OFF deliberately. Several of its call sites are on the
+// per-iteration path -- "entry hook hit" and "return hook hit" fire from VMX-root on
+// EVERY run with no rate limit at all, which at a few hundred execs/second is exactly
+// the unbounded flood described above. It also drowns the sanitizer's own lines: a run
+// that emitted 34 target relaunches produced only 29 kernel log lines, all of them from
+// arm time, because everything from VMX-root was being dropped. Turn it back on only
+// for short, low-rate persistence bring-up.
 #define WINAFL_HOOK_KERNEL_VERBOSE 0
+#define WINAFL_SAN_KERNEL_VERBOSE  1
 
+// Per category, per arm. Kept SMALL on purpose. The budget refreshes at every arm, and
+// the user side fsyncs every message to disk (deliberately -- the log has to survive a
+// bug check), so each line costs milliseconds. A run that emitted a few hundred lines
+// was measured running FIVE SECONDS behind, with messages truncated mid-string: by then
+// the kernel ring is backed up and the log is no longer a reliable record of what
+// happened, which is exactly when you need it most. Eight lines per category still shows
+// the shape of a run; the cumulative g_SanStats in the reset summary carry the totals.
+#define WINAFL_SAN_LOG_LIMIT       8
+
+//
+// The first argument to these wrappers is a NAMED parameter (`fmt`) on purpose: it
+// must reach LogInfo() as a lone string literal and never be folded into __VA_ARGS__.
+// LogInfo() itself pastes `format` between two string literals ("... | " fmt "\n"),
+// and MSVC's legacy preprocessor hands a nested __VA_ARGS__ over as a single blob --
+// expanding to `"..." "text", a, b "\n"` (syntax error: missing ')' before 'string').
+// ##__VA_ARGS__ elides the comma when there are no trailing args. The same rule
+// applies to WINAFL_SAN_KLOG below.
+//
 #if WINAFL_HOOK_KERNEL_VERBOSE
-#    define WINAFL_KLOG(...) LogInfo(__VA_ARGS__)
+#    define WINAFL_KLOG(fmt, ...) LogInfo(fmt, ##__VA_ARGS__)
 #else
-#    define WINAFL_KLOG(...) ((VOID)0)
+#    define WINAFL_KLOG(fmt, ...) ((VOID)0)
 #endif
 
 //
@@ -73,6 +110,283 @@ static PMDL g_WinaflHookMdl = NULL;
 //
 static BOOLEAN g_WinaflBatchActive = FALSE;
 static UINT32  g_WinaflBatchIndex  = 0;
+
+//
+// =================== WinAFL EPT guard-page sanitizer state ===================
+//
+// Heap-overflow + use-after-free detection (ABI v3). Backed by the hyperhv EPT
+// guard primitives (VmFuncEptGuardProtectPage / VmFuncEptGuardRestorePage). All of
+// this is inert unless the fuzzer arms with SanitizeFlags != 0 and registers
+// allocator hooks; MasoudPrologue then routes the extra !epthook hits here.
+//
+// Lifetime model -- TWO DIFFERENT LIFETIMES, and conflating them corrupts the guest
+// heap (this was a real bug; see below):
+//
+//   * EPT protections (g_SanPages) are PER BATCH. WinaflSanBatchReset() restores
+//     every protected page to its original EPT entry at the END of each run/batch
+//     (normal finish AND crash) -- so by the time the fuzzer kills the target the
+//     physical frames are RWX again and cannot fault an unrelated consumer after the
+//     frames are freed. (Restoring EPT/INVEPT is only valid in VMX-root, which is why
+//     it is done at these hook boundaries and not from the passive-level disarm.)
+//
+//   * Reposition records (g_SanAllocs) are PER TARGET PROCESS. They must NOT be
+//     dropped at a batch boundary. Guarding hands the caller a REPOSITIONED pointer,
+//     and the free hook can only un-shift a pointer it still has a record for. The
+//     guest's heap is not reset between batches: a buffer allocated in batch N is
+//     routinely freed in batch N+1 (ntdll's own long-lived allocations especially).
+//     If the record were gone by then, the free would look FOREIGN and the shifted
+//     pointer would reach the real allocator -- which is not a heap block base ->
+//     heap corruption -> hangs and a bug check. Only WinaflSanProcessReset(), at the
+//     first entry hit of a FRESH target, clears them.
+//
+//   * A guarded allocation's guard page therefore lives until it is freed or the
+//     batch ends, but the knowledge that it is repositioned lives as long as the
+//     process that holds the pointer. UAF holds a freed buffer's pages no-access
+//     until the batch ends; the buffer itself is never returned to the allocator.
+//
+#define WINAFL_SAN_PAGE_MASK    ((UINT64)(PAGE_SIZE - 1))
+#define WINAFL_SAN_PAGE_DOWN(x) ((UINT64)(x) & ~WINAFL_SAN_PAGE_MASK)
+#define WINAFL_SAN_PAGE_UP(x)   WINAFL_SAN_PAGE_DOWN((UINT64)(x) + WINAFL_SAN_PAGE_MASK)
+
+//
+// Per-batch capacities. If any is exceeded the sanitizer FAILS OPEN (it stops
+// guarding new allocations / pages but never blocks the run), so a pathological
+// input can at worst lose detection, never wedge the fuzzer.
+//
+#define WINAFL_SAN_MAX_ALLOCS     4096                 // tracked allocations per TARGET PROCESS
+#define WINAFL_SAN_MAX_PAGES      8192                 // protected phys pages per batch
+#define WINAFL_SAN_MAX_PENDING    128                  // in-flight alloc calls (entry->ret)
+#define WINAFL_SAN_MAX_GUARD_SIZE (16 * 1024 * 1024)   // don't guard allocs larger than this
+
+//
+// ===================== QUARANTINE BOUND (UAF mode) =========================
+//
+// How many freed buffers may be held back from the allocator at once. Past this,
+// frees un-reposition and go through to the real allocator exactly as in
+// overflow-only mode.
+//
+// This bound is NOT a nicety -- without it the box eventually bug-checks, and the
+// path is worth spelling out because it is entirely non-obvious:
+//
+//   holding every freed buffer means the heap can never reuse memory, so every run
+//   allocates FRESH virtual pages backed by FRESH physical pages -> each new physical
+//   page in a previously-untouched 2MB region forces EptSplitLargePage to take a
+//   VMM_EPT_DYNAMIC_SPLIT (a full 512-entry PML1 = 4KB of NON-PAGED POOL) -- and
+//   nothing ever gives one back. There is no PoolManagerFreePool for
+//   SPLIT_2MB_PAGING_TO_4KB_PAGE anywhere in the tree. At a few hundred execs a
+//   second that is a steady, permanent non-paged pool leak, and non-paged pool
+//   exhaustion takes the machine down after a couple of minutes.
+//
+// Bounding the quarantine lets the heap recycle its memory, so the guarded pages keep
+// landing in the same handful of 2MB regions that are already split.
+//
+// The detection cost is small, because guard/held pages are restored at every RUN
+// boundary anyway: a buffer held beyond the run that freed it is no longer protected
+// and can no longer be detected. Quarantining it past that point leaked memory for no
+// benefit at all. (ASAN bounds its quarantine for the same reason; it can evict by
+// really freeing the oldest, which we cannot do from VMX-root -- so we simply stop
+// quarantining once full.)
+//
+#define WINAFL_SAN_MAX_QUARANTINE 256
+
+//
+// One guarded allocation.
+//
+typedef struct _WINAFL_SAN_ALLOC_META
+{
+    UINT64  UserPtr;    // pointer handed to the caller (free lookup key)
+    UINT64  RealBase;   // the allocator's real (enlarged) base
+    UINT64  OrigSize;   // caller's requested size (bytes)
+    UINT64  GuardVa;    // guard page VA (== page-aligned end of the user buffer)
+    UINT64  HeapHandle; // allocator's 1st arg (RCX) -- the heap this block belongs to.
+                        // Quarantine eviction may only hand a block back to the SAME
+                        // heap, so this is what makes eviction safe.
+    UINT32  InputIndex; // owning batch run index (the input blamed on a fault)
+    BOOLEAN Freed;      // TRUE once a free() has held it
+} WINAFL_SAN_ALLOC_META;
+
+//
+// One EPT-protected guest-physical page (the reverse map used by the classifier,
+// and the restore list). Kind says how to classify a fault landing here.
+//
+typedef struct _WINAFL_SAN_PAGE_META
+{
+    UINT64 Gpa;           // page-aligned guest-physical address
+    UINT64 OriginalEntry; // PML1 entry to restore at batch end
+    UINT32 AllocIndex;    // index into g_SanAllocs
+    UINT32 Kind;          // WINAFL_SAN_FAULT_OVERFLOW | WINAFL_SAN_FAULT_UAF
+} WINAFL_SAN_PAGE_META;
+
+//
+// One in-flight allocation call: captured at the allocator entry, consumed at the
+// return-trampoline (post) stub.
+//
+// Records are keyed by RetSlot -- the STACK ADDRESS whose return slot we overwrote
+// with the post stub -- and NOT by stack order. A plain LIFO is wrong here: the
+// hooked allocator is ntdll's, so EVERY thread of the target process that is
+// scheduled on the pinned core runs through it, and their calls interleave
+// arbitrarily. Popping "the last pushed" would then pair a return with another
+// thread's OrigSize/RealRA and send the guest to a wild address. The stack slot is
+// unique per (thread, frame) and is exactly what the return consumed, so matching on
+// it is exact for interleaved and recursive calls alike.
+//
+typedef struct _WINAFL_SAN_PENDING
+{
+    UINT64 OrigSize;   // caller's requested size captured at entry
+    UINT64 RealRA;     // the caller's real return address (restored at the post stub)
+    UINT64 RetSlot;    // guest stack address we planted the stub in (the match key)
+    UINT64 HeapHandle; // allocator's 1st arg (RCX), carried into the alloc record
+} WINAFL_SAN_PENDING;
+
+static WINAFL_SAN_ALLOC_META g_SanAllocs[WINAFL_SAN_MAX_ALLOCS];
+static UINT32                g_SanAllocCount   = 0;
+static WINAFL_SAN_PAGE_META  g_SanPages[WINAFL_SAN_MAX_PAGES];
+static UINT32                g_SanPageCount    = 0;
+static WINAFL_SAN_PENDING    g_SanPending[WINAFL_SAN_MAX_PENDING];
+static UINT32                g_SanPendingTop   = 0;
+
+//
+// Buffers currently withheld from the allocator (UAF quarantine). Per TARGET PROCESS,
+// like g_SanAllocs -- a withheld buffer is withheld until the process dies, so this is
+// only cleared by WinaflSanProcessReset. See WINAFL_SAN_MAX_QUARANTINE.
+//
+static UINT32                g_SanQuarantineCount = 0;
+
+//
+// ===================== WHAT WE ARE ALLOWED TO GUARD =========================
+//
+// Guarding is restricted to allocations made BY THE FUZZED CODE ITSELF: on the fuzz
+// thread, between the fuzz-entry hook and the return hook. Everything else runs
+// untouched.
+//
+// This is a correctness requirement, not an optimisation. We hook ntdll's
+// RtlAllocateHeap, so without this scope EVERY allocation in the target -- the loader's,
+// the CRT's, every worker thread's -- gets handed a REPOSITIONED pointer. Only
+// alloc and free are hooked: the moment any of that memory reaches an unhooked heap
+// API (RtlReAllocateHeap, RtlSizeHeap, RtlValidateHeap), that API reads a chunk header
+// at UserPtr-N which is not a chunk header, and the process dies. Measured: the target
+// died and relaunched 8 times in 7 seconds, and each death orphaned no-access guard
+// pages that then bug-checked the box.
+//
+// The fuzzed function's own allocations are the ones a fuzzer cares about anyway.
+//
+static BOOLEAN g_WinaflInFuzzRun     = FALSE; // between fuzz-entry and return
+static UINT64  g_WinaflFuzzThreadId  = 0;     // the thread that runs the fuzz function
+
+//
+// ========================= CIRCUIT BREAKER =========================
+//
+// Every way this sanitizer can go wrong ends the same way: it wedges or kills the
+// target, the target dies holding no-access pages, Windows recycles those frames, and
+// the box bug-checks. The failure is also self-reinforcing -- a target that dies in
+// 200ms relaunches five times a second, each relaunch orphaning more pages.
+//
+// So the sanitizer counts its own anomalies (unrecoverable post stubs, emergency
+// heals) and, past a small threshold, STOPS GUARDING for the rest of the session:
+// no new allocation is repositioned or protected. It does NOT stop intercepting
+// free() -- pointers already handed out are still shifted and must still be
+// un-shifted -- and it never blocks a run. The job degrades into an ordinary fuzzing
+// session that happens not to detect anything, which is a far better outcome than
+// taking the machine down.
+//
+#define WINAFL_SAN_MAX_ANOMALIES 8
+
+static BOOLEAN g_SanDisabled  = FALSE;
+static UINT32  g_SanAnomalies = 0;
+
+//
+// ===================== Sanitizer logging categories ==========================
+//
+// The sanitizer switch (WINAFL_SAN_KERNEL_VERBOSE) and per-category rate limit
+// (WINAFL_SAN_LOG_LIMIT) live with the other logging knobs at the top of the file.
+// The g_SanStats counters keep accumulating past that limit and are dumped by the
+// per-batch reset summary, so a long run still reports totals after the burst.
+//
+typedef enum _WINAFL_SAN_LOG_CAT
+{
+    SAN_LOG_ARM = 0,   // one-shot arm-time configuration dump
+    SAN_LOG_ALLOC,     // allocator entry (pre stage)
+    SAN_LOG_POST,      // return trampoline (post stage) + guard placement
+    SAN_LOG_FREE,      // free entry (hold / pass-through / double-free)
+    SAN_LOG_PROTECT,   // EPT protect of one page (incl. failures)
+    SAN_LOG_RESET,     // per-batch restore + summary
+    SAN_LOG_FAULT,     // classified guard/UAF fault
+    SAN_LOG_FOREIGN,   // EPT violation NOT owned by us (passed through)
+    SAN_LOG_ERROR,     // give-up / fail-open paths worth seeing every time
+    SAN_LOG_CAT_MAX
+} WINAFL_SAN_LOG_CAT;
+
+//
+// Cumulative counters (never reset by the log limiter; cleared only at arm time).
+//
+typedef struct _WINAFL_SAN_STATS
+{
+    UINT64 AllocHooked;       // allocator entries we rerouted
+    UINT64 AllocPassed;       // allocator entries we let run untouched
+    UINT64 AllocSkippedScope; // allocator entries outside the fuzzed run (not ours to guard)
+    UINT64 PostGuarded;    // allocations that got a guard page
+    UINT64 PostUnguarded;  // allocations that fell open (no guard)
+    UINT64 PostOrphan;     // post-stub hits with an empty pending stack (unrecoverable)
+    UINT64 PostSlotMiss;   // post-stub hits whose stack-slot key missed (fell back to LIFO)
+    UINT64 XlateFail;      // VA->PA translation failures
+    UINT64 ProtectFail;    // VmFuncEptGuardProtectPage failures
+    UINT64 FreeHeld;       // frees intercepted + held (UAF mode)
+    UINT64 FreePassed;     // frees passed through to the real allocator
+    UINT64 FreeForeign;    // frees of pointers we do not track
+    UINT64 DoubleFree;         // double-free detections
+    UINT64 QuarantineEvicted;  // quarantined buffers handed back to keep detection alive
+    UINT64 Faults;         // classified guard/UAF faults
+    UINT64 ForeignFaults;  // EPT violations we did not own
+} WINAFL_SAN_STATS;
+
+static WINAFL_SAN_STATS g_SanStats = {0};
+
+#if WINAFL_SAN_KERNEL_VERBOSE
+static volatile LONG g_SanLogCount[SAN_LOG_CAT_MAX] = {0};
+
+//
+// `fmt` is a named parameter for the same reason as WINAFL_KLOG (see the logging
+// block at the top of the file): it must reach LogInfo() as a lone string literal,
+// never folded into __VA_ARGS__. The (cat) counter rate-limits each category to
+// WINAFL_SAN_LOG_LIMIT lines; ##__VA_ARGS__ elides the comma when there are no args.
+//
+#    define WINAFL_SAN_KLOG(cat, fmt, ...)                                           \
+        do                                                                           \
+        {                                                                            \
+            if (InterlockedIncrement(&g_SanLogCount[(cat)]) <= WINAFL_SAN_LOG_LIMIT) \
+                LogInfo(fmt, ##__VA_ARGS__);                                         \
+        } while (0)
+
+//
+// Reset the per-category log budget (called at arm) so each fuzzing session gets a
+// fresh burst of diagnostics instead of staying silent after the first run.
+//
+static VOID
+WinaflSanLogReset(VOID)
+{
+    UINT32 i;
+    for (i = 0; i < SAN_LOG_CAT_MAX; i++)
+        g_SanLogCount[i] = 0;
+    RtlZeroMemory(&g_SanStats, sizeof(g_SanStats));
+}
+#else
+#    define WINAFL_SAN_KLOG(cat, fmt, ...) ((VOID)0)
+static VOID
+WinaflSanLogReset(VOID)
+{
+    RtlZeroMemory(&g_SanStats, sizeof(g_SanStats));
+}
+#endif
+
+//
+// Forward declarations for the sanitizer routines used by the run/park hooks that
+// are defined earlier in this file. WinaflSanBatchReset restores every guarded page
+// and clears the metadata; it is safe (a no-op) when nothing is protected, so the
+// run/park boundaries can call it unconditionally.
+//
+static VOID    WinaflSanBatchReset(UINT32 CoreId);
+static VOID    WinaflSanProcessReset(UINT32 CoreId);
+BOOLEAN        WinaflSanHandleEptViolation(UINT32 CoreId, UINT64 ViolationQualification, UINT64 GuestPhysicalAddr);
 
 VOID
 WinaflHookSetSharedPage(PWINAFL_HOOK_SHARED Shared)
@@ -176,9 +490,102 @@ WinaflHookArm(UINT64 SharedUserVa, UINT32 SharedSize)
     g_WinaflBatchActive = FALSE;
     g_WinaflBatchIndex  = 0;
 
-    LogInfo("[winafl] armed: shared=0x%llx fuzz=0x%llx park=0x%llx pid=%u rcx=%u",
-            (UINT64)Shared, Shared->FuzzAddress, Shared->ParkStubAddress,
-            Shared->TargetProcessId, Shared->RcxDelivery);
+    WINAFL_KLOG("[winafl] armed: shared=0x%llx fuzz=0x%llx park=0x%llx pid=%u rcx=%u",
+                (UINT64)Shared, Shared->FuzzAddress, Shared->ParkStubAddress,
+                Shared->TargetProcessId, Shared->RcxDelivery);
+
+    //
+    // Sanitizer: give this session a fresh log budget and dump the resolved
+    // configuration so a bring-up log always starts with the exact hook set.
+    //
+    // DO NOT clear g_SanPages/g_SanAllocs here. Arming runs at PASSIVE_LEVEL, where
+    // restoring EPT entries (INVEPT) is illegal, so if a previous target was torn
+    // down mid-batch its pages are still no-access. Those entries are the ONLY
+    // record of how to put them back; the first VMX-root touchpoint of the new
+    // target (WinaflHookOnEntry -> WinaflSanBatchReset) uses them to heal the
+    // orphaned frames. Zeroing the counters here would strand them permanently.
+    //
+    WinaflSanLogReset();
+
+    //
+    // Start all-core (default). The pinned core is only known once the target hits
+    // the fuzz entry, so WinaflHookOnEntry narrows the scope to that core. Any hooks
+    // registered before then (the fuzz-entry hook) are in the target's private image,
+    // so all-core installs of them are harmless (no other process maps those pages).
+    //
+    VmFuncEptHookSetForceSingleCore(-1);
+
+    if (g_SanPageCount != 0)
+    {
+        WINAFL_SAN_KLOG(SAN_LOG_ARM,
+                        "[san] arm: %u page(s) still protected from a previous target -- they will be "
+                        "restored at the first VMX-root hook of this run",
+                        g_SanPageCount);
+    }
+
+    if (Shared->SanitizeFlags != 0)
+    {
+        UINT32 i;
+        WINAFL_SAN_KLOG(SAN_LOG_ARM,
+                        "[san] armed: flags=0x%x (overflow=%u uaf=%u) redzone=0x%x poststub=0x%llx allocators=%u",
+                        Shared->SanitizeFlags,
+                        (Shared->SanitizeFlags & WINAFL_SAN_OVERFLOW) ? 1 : 0,
+                        (Shared->SanitizeFlags & WINAFL_SAN_UAF) ? 1 : 0,
+                        WINAFL_SAN_REDZONE,
+                        Shared->PostStubAddress,
+                        Shared->SanAllocatorCount);
+
+        for (i = 0; i < Shared->SanAllocatorCount && i < WINAFL_SAN_MAX_ALLOCATORS; i++)
+        {
+            WINAFL_SAN_KLOG(SAN_LOG_ARM,
+                            "[san]   allocator[%u]: addr=0x%llx kind=%u (1=alloc 2=free) argreg=%u "
+                            "retbool=%u flagsreg=%u zeroflag=0x%llx",
+                            i,
+                            Shared->SanAllocators[i].Address,
+                            Shared->SanAllocators[i].Kind,
+                            Shared->SanAllocators[i].ArgReg,
+                            Shared->SanAllocators[i].RetIsBool,
+                            Shared->SanAllocators[i].FlagsReg,
+                            Shared->SanAllocators[i].ZeroFlag);
+        }
+
+        //
+        // The guard page can only be protected if it has a physical frame behind it,
+        // and heap memory is demand-zero. Without a forced zero flag on an allocator,
+        // its redzone is never written, so VA->PA of the guard page returns 0 and
+        // every overflow in that allocator's buffers is missed. This is the single
+        // most common reason for "the sanitizer never fires", so say it at arm time
+        // rather than leaving it to be inferred from a pile of XLATE-FAIL lines.
+        //
+        if (Shared->SanitizeFlags & WINAFL_SAN_OVERFLOW)
+        {
+            for (i = 0; i < Shared->SanAllocatorCount && i < WINAFL_SAN_MAX_ALLOCATORS; i++)
+            {
+                if (Shared->SanAllocators[i].Kind == WINAFL_SAN_FN_ALLOC &&
+                    Shared->SanAllocators[i].ZeroFlag == 0)
+                {
+                    WINAFL_SAN_KLOG(SAN_LOG_ARM,
+                                    "[san] *** WARNING: allocator[%u] (0x%llx) has no zero flag -- its redzone "
+                                    "stays demand-zero, so guard pages will fail to translate and overflows "
+                                    "will be MISSED ***",
+                                    i, Shared->SanAllocators[i].Address);
+                }
+            }
+        }
+
+        //
+        // Loud warning for the configuration that corrupts the guest heap: we hand
+        // the caller a REPOSITIONED pointer when overflow guarding is on, but only
+        // intercept free() when UAF is on. With UAF off, the app's free() reaches
+        // the real allocator holding a pointer that is not a heap block base.
+        //
+        if ((Shared->SanitizeFlags & WINAFL_SAN_OVERFLOW) && !(Shared->SanitizeFlags & WINAFL_SAN_UAF))
+        {
+            WINAFL_SAN_KLOG(SAN_LOG_ARM,
+                            "[san] *** WARNING: overflow-only mode repositions allocations but does NOT "
+                            "intercept free() -- the real allocator will receive shifted pointers ***");
+        }
+    }
 
     //
     // Publish last: once g_WinaflHookShared is non-NULL the hooks are live.
@@ -202,6 +609,12 @@ WinaflHookDisarm()
 
     g_WinaflHookShared = NULL;
     g_WinaflHookMdl    = NULL;
+
+    //
+    // Release the single-core exec-hook scoping so any later (non-WinAFL) hooks
+    // install on all cores again.
+    //
+    VmFuncEptHookSetForceSingleCore(-1);
 
     if (Mdl != NULL)
     {
@@ -292,6 +705,13 @@ WinaflHookSnapshotEntry(PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs)
 static VOID
 WinaflHookPark(PWINAFL_HOOK_SHARED Shared)
 {
+    //
+    // Parking always ends a run, whatever got us here (normal finish, crash report,
+    // orphaned post stub). Clearing the guard scope here means no path can leave it
+    // set while the guest is not executing fuzzed code.
+    //
+    g_WinaflInFuzzRun = FALSE;
+
     SetGuestRSP(Shared->SavedRsp);
     VmFuncSetRip(Shared->ParkStubAddress);
 }
@@ -300,7 +720,7 @@ WinaflHookPark(PWINAFL_HOOK_SHARED Shared)
 // Hit on the fuzzed function entry.
 //
 static BOOLEAN
-WinaflHookOnEntry(PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs)
+WinaflHookOnEntry(UINT32 CoreId, PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs)
 {
     if (!Shared->FirstHitDone)
     {
@@ -311,6 +731,32 @@ WinaflHookOnEntry(PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs)
         // function before the return hook is installed, or we would miss the
         // epilogue.
         //
+        // Also clear any sanitizer guard pages left over from a previous (possibly
+        // torn-down) target: restoring them here, at the first VMX-root touchpoint
+        // of the fresh process, heals orphaned no-access frames before they can be
+        // reused. (A no-op when nothing is protected.)
+        //
+        // This is the ONE place the reposition records are dropped too: the target is
+        // brand new, so no guest pointer from the previous one can still be live. Every
+        // other boundary uses WinaflSanBatchReset, which keeps them (see the lifetime
+        // model above) -- dropping them mid-process is what lets a shifted pointer reach
+        // the real allocator and corrupt the guest heap.
+        //
+        WinaflSanProcessReset(CoreId);
+
+        //
+        // We are now running on the target's PINNED core (the target's affinity
+        // restricts it to one core, so the fuzz-entry #BP always fires here). If the
+        // sanitizer is armed, scope every subsequently-registered exec hook -- the
+        // return hook and, crucially, the ntdll allocator hooks -- to THIS core only.
+        // The allocators live in shared ntdll, so hooking them on all cores would
+        // trap every process's heap call system-wide (2 VM-exits each) and make the
+        // whole box unresponsive. Hooking only the pinned core catches all of the
+        // target's calls while leaving every other core (and process) untouched.
+        //
+        if (Shared->SanitizeFlags != 0)
+            VmFuncEptHookSetForceSingleCore((INT32)CoreId);
+
         WinaflHookSnapshotEntry(Shared, Regs);
         Shared->FirstHitDone = 1;
         Shared->Status       = WINAFL_STATUS_ENTRY;
@@ -331,7 +777,7 @@ WinaflHookOnEntry(PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs)
     // we do, the entry CC was left in place: log loudly, restore the snapshot,
     // and let it run so the guest is not wedged.
     //
-    LogInfo("[winafl] WARNING: unexpected later ENTRY breakpoint (entry CC should have been removed)");
+    WINAFL_KLOG("[winafl] WARNING: unexpected later ENTRY breakpoint (entry CC should have been removed)");
     RtlCopyMemory(Regs, &Shared->SavedRegs, sizeof(WINAFL_HOOK_REGS));
     SetGuestRSP(Shared->SavedRsp);
     WinaflHookLogState("ENTRY(late)", Regs);
@@ -344,8 +790,14 @@ WinaflHookOnEntry(PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs)
 // MasoudEpilogue, where we rewind + park.
 //
 static BOOLEAN
-WinaflHookOnReturn(PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs)
+WinaflHookOnReturn(UINT32 CoreId, PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs)
 {
+    //
+    // The fuzzed function has returned: stop treating this thread's allocations as
+    // guardable until the next run is released. (Re-set below for a batch re-entry.)
+    //
+    g_WinaflInFuzzRun = FALSE;
+
     //
     // ---- Batched run (WINAFL_CMD_GO_BATCH) ----
     // Run BatchCount inputs back-to-back. PT stays enabled across the whole batch
@@ -392,19 +844,33 @@ WinaflHookOnReturn(PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs)
             // hook is a #BP epthook, so EptCheckAndHandleBreakpoint already
             // suppressed the RIP increment -- our VmFuncSetRip is the last writer.
             //
+            //
+            // Release this run's guard pages before starting the next one. Protections
+            // are restored PER RUN, not per batch, on purpose: a target that dies while
+            // pages are still no-access orphans those frames, and Windows then hands
+            // them to another process -- which is what bug-checks the box. Per-run
+            // restore keeps that window one iteration wide instead of a whole batch
+            // (~100x smaller). A bug in persistent fuzzing manifests within the run that
+            // triggered it, so nothing detectable is lost.
+            //
+            WinaflSanBatchReset(CoreId);
+
             RtlCopyMemory(Regs, &Shared->SavedRegs, sizeof(WINAFL_HOOK_REGS));
             SetGuestRSP(Shared->SavedRsp);
             WinaflHookLoadInput(Shared, Regs, i);
             HyperTracePtResumeCurrentCore();
+            g_WinaflInFuzzRun = TRUE; // next run starts here: its allocations are guardable
             VmFuncSetRip(Shared->FuzzAddress);
             return TRUE; // handled in kernel: skip the (empty) action + epilogue
         }
 
         //
         // Last run of the batch: PT is already paused above; just park the guest and
-        // wake the fuzzer once.
+        // wake the fuzzer once. End-of-batch: restore all sanitizer guard pages (held
+        // freed buffers are released here) so the target's frames are RWX again.
         //
         g_WinaflBatchActive = FALSE;
+        WinaflSanBatchReset(CoreId);
         Shared->Status      = WINAFL_STATUS_ITER_DONE;
         WINAFL_KLOG("[winafl] BATCH done: %u runs (PT paused, parking)", Shared->BatchCount);
         WinaflHookPark(Shared);
@@ -424,6 +890,11 @@ WinaflHookOnReturn(PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs)
 
     Shared->IterationCount++;
     Shared->Status = WINAFL_STATUS_ITER_DONE;
+    //
+    // End of a single run (a batch of one for sanitizer purposes): release any guard
+    // pages / held freed buffers from this run.
+    //
+    WinaflSanBatchReset(CoreId);
     WINAFL_KLOG("[winafl] RETURN breakpoint: iteration %lld returned (PT paused)", Shared->IterationCount);
     WinaflHookLogState("RETURN", Regs);
     return FALSE; // run the (empty) event action, then MasoudEpilogue rewinds + parks
@@ -478,6 +949,12 @@ WinaflHookOnParkCpuid(PROCESSOR_DEBUGGING_STATE * DbgState)
         RtlCopyMemory(DbgState->Regs, &Shared->SavedRegs, sizeof(WINAFL_HOOK_REGS));
         SetGuestRSP(Shared->SavedRsp);
 
+        //
+        // Start each run/batch with a clean sanitizer slate (idempotent; the batch
+        // end already restored, so this only matters if a prior batch was cut short).
+        //
+        WinaflSanBatchReset(DbgState->CoreId);
+
         if (Batch)
         {
             //
@@ -501,6 +978,14 @@ WinaflHookOnParkCpuid(PROCESSOR_DEBUGGING_STATE * DbgState)
         WINAFL_KLOG("[winafl] park(cpuid): %s -> resume at fuzz=0x%llx (iter=%lld)",
                     Batch ? "GO_BATCH" : "GO", Shared->FuzzAddress, Shared->IterationCount);
         HyperTracePtResumeCurrentCore();
+
+        //
+        // The run starts here, on THIS thread: from now until the return hook, this
+        // thread's allocations are the fuzzed code's own and may be guarded.
+        //
+        g_WinaflFuzzThreadId = (UINT64)PsGetCurrentThreadId();
+        g_WinaflInFuzzRun    = TRUE;
+
         VmFuncSetRip(Shared->FuzzAddress);
         //
         // CRITICAL: suppress the VM-exit framework's default RIP increment. Unlike
@@ -554,12 +1039,1145 @@ WinaflHookOnParkCpuid(PROCESSOR_DEBUGGING_STATE * DbgState)
     return TRUE;
 }
 
+//
+// ==================== WinAFL EPT guard-page sanitizer =======================
+//
+// The routines below implement heap-overflow + use-after-free detection. They are
+// only reached when the fuzzer arms with SanitizeFlags != 0 and registers the
+// allocator + return-stub !epthooks; MasoudPrologue routes those hits here.
+//
+
+//
+// Map a WINAFL_SAN_REG to the matching field in the guest GP register block, so we
+// can read/patch a call's size or pointer argument by its calling-convention slot.
+//
+static UINT64 *
+WinaflSanRegPtr(GUEST_REGS * Regs, UINT32 Reg)
+{
+    switch (Reg)
+    {
+    case WINAFL_SAN_REG_RCX:
+        return &Regs->rcx;
+    case WINAFL_SAN_REG_RDX:
+        return &Regs->rdx;
+    case WINAFL_SAN_REG_R8:
+        return &Regs->r8;
+    case WINAFL_SAN_REG_R9:
+        return &Regs->r9;
+    default:
+        return NULL;
+    }
+}
+
+//
+// Find a registered allocator/free function by its entry VA (NULL if none / off).
+//
+static WINAFL_SAN_ALLOCATOR *
+WinaflSanFindAllocatorByAddr(PWINAFL_HOOK_SHARED Shared, UINT64 Va)
+{
+    UINT32 i;
+
+    if (Shared->SanitizeFlags == 0)
+        return NULL;
+
+    for (i = 0; i < Shared->SanAllocatorCount && i < WINAFL_SAN_MAX_ALLOCATORS; i++)
+    {
+        if (Shared->SanAllocators[i].Kind != WINAFL_SAN_FN_NONE &&
+            Shared->SanAllocators[i].Address == Va)
+        {
+            return &Shared->SanAllocators[i];
+        }
+    }
+
+    return NULL;
+}
+
+//
+// Look up a guarded allocation by the pointer we handed the caller (-1 if none).
+//
+// NEWEST FIRST. Records now live for the whole target process, so the heap can hand
+// the same address out again after a real free; the youngest record is the live one.
+// Scanning forwards would find a stale, already-freed record and misreport the next
+// legitimate free of that address as a double free. It is also the faster order:
+// allocate-then-free-soon is the common shape, so the match is usually a few entries
+// from the end.
+//
+static int
+WinaflSanFindAllocByUserPtr(UINT64 UserPtr)
+{
+    UINT32 i;
+
+    for (i = g_SanAllocCount; i > 0; i--)
+    {
+        if (g_SanAllocs[i - 1].UserPtr == UserPtr)
+            return (int)(i - 1);
+    }
+
+    return -1;
+}
+
+//
+// Pick the buffer to hand back to the allocator when the quarantine is full.
+//
+// OLDEST FIRST (FIFO): the whole point of a quarantine is to keep recently-freed
+// memory poisoned for as long as possible, so the buffer freed longest ago is the one
+// whose detection value has already expired.
+//
+// A candidate must be (a) still tracked, (b) already freed/quarantined -- never a live
+// allocation the guest still holds a pointer to -- and (c) from the SAME heap as the
+// call that is about to run, since that call is what will free it. ExcludeIdx keeps the
+// record being quarantined right now out of the running.
+//
+static int
+WinaflSanFindEvictionCandidate(UINT64 HeapHandle, int ExcludeIdx)
+{
+    UINT32 i;
+
+    for (i = 0; i < g_SanAllocCount; i++)
+    {
+        if ((int)i == ExcludeIdx)
+            continue;
+        if (g_SanAllocs[i].UserPtr == 0)
+            continue; // tombstoned: already back with the allocator
+        if (!g_SanAllocs[i].Freed)
+            continue; // live allocation -- freeing it would be a use-after-free WE caused
+        if (g_SanAllocs[i].HeapHandle != HeapHandle)
+            continue; // different heap: freeing it here would corrupt both
+
+        return (int)i;
+    }
+
+    return -1;
+}
+
+//
+// Index returned by WinaflSanPeekSlot when the table is exhausted.
+//
+#define WINAFL_SAN_NO_SLOT 0xFFFFFFFFu
+
+//
+// The record slot the next tracked allocation WOULD use, without committing to it
+// (the caller only commits if the guard actually goes down). Prefers a fresh append
+// and otherwise recycles a tombstoned record -- one whose chunk the heap has already
+// taken back, so no guest pointer can still refer to it. Without recycling, a target
+// that allocates for hours would exhaust the table and silently stop detecting.
+//
+static UINT32
+WinaflSanPeekSlot(VOID)
+{
+    UINT32 i;
+
+    if (g_SanAllocCount < WINAFL_SAN_MAX_ALLOCS)
+        return g_SanAllocCount;
+
+    for (i = 0; i < g_SanAllocCount; i++)
+    {
+        if (g_SanAllocs[i].UserPtr == 0)
+            return i;
+    }
+
+    return WINAFL_SAN_NO_SLOT;
+}
+
+//
+// Retire (tombstone) every stale record covering memory the allocator has just handed
+// out again, i.e. a chunk we previously un-repositioned and really freed. Keeping a
+// stale but still-keyed record would let a free of the NEW allocation match the OLD
+// one and be misreported as a double free -- and, once records outlive a batch, those
+// stale records accumulate for the life of the process.
+//
+// Matching is by CONTAINMENT, not just an equal base: the heap is free to split or
+// coalesce what it reclaimed, so the reused chunk often comes back under a different
+// base that still covers the old buffer. Any address inside the newly-returned chunk
+// provably belongs to this allocation now, so an older record keyed there is dead.
+//
+// Only records already marked Freed are retired. A record that is still live cannot
+// legitimately overlap a fresh allocation, and tombstoning one would strand the
+// guest's repositioned pointer with no way to un-shift it at free time.
+//
+static VOID
+WinaflSanRetireStaleRecords(UINT64 RealBase, UINT64 ChunkSize)
+{
+    UINT64 End = RealBase + ChunkSize;
+    UINT32 i;
+
+    for (i = 0; i < g_SanAllocCount; i++)
+    {
+        if (g_SanAllocs[i].UserPtr == 0 || !g_SanAllocs[i].Freed)
+            continue;
+
+        if (g_SanAllocs[i].RealBase == RealBase ||
+            (g_SanAllocs[i].UserPtr >= RealBase && g_SanAllocs[i].UserPtr < End))
+        {
+            g_SanAllocs[i].UserPtr = 0; // tombstone: no future lookup matches it
+        }
+    }
+}
+
+//
+// Force one guest-virtual page to no-access via EPT, recording the reverse map
+// (GPA -> alloc + kind) used by the classifier and the restore list. Physical
+// pages of a multi-page range are non-contiguous, so callers protect page by page.
+// Returns FALSE (fail open) if the page is not present or a table is full.
+//
+static BOOLEAN
+WinaflSanProtectPage(UINT32 CoreId, UINT64 Va, UINT32 AllocIndex, UINT32 Kind)
+{
+    UINT64 Gpa  = (UINT64)VirtualAddressToPhysicalAddressOnTargetProcess((PVOID)WINAFL_SAN_PAGE_DOWN(Va));
+    UINT64 Orig = 0;
+    UINT32 i;
+
+    if (Gpa == 0)
+    {
+        g_SanStats.XlateFail++;
+        //
+        // PROTECT, not ERROR. This is a routine fail-open that fires often, and in the
+        // ERROR category it ate that budget (69 of 72 lines in one run) and starved the
+        // rare, loud events that share it -- post-stub ORPHAN especially. Losing the one
+        // line that explains a fabricated crash to a flood of routine ones made a real
+        // bug undiagnosable.
+        //
+        WINAFL_SAN_KLOG(SAN_LOG_PROTECT,
+                        "[san] protect XLATE-FAIL: va=0x%llx (page 0x%llx) kind=%u idx=%u -- page not present, failing open",
+                        Va, WINAFL_SAN_PAGE_DOWN(Va), Kind, AllocIndex);
+        return FALSE; // page not present -> cannot guard
+    }
+
+    Gpa = WINAFL_SAN_PAGE_DOWN(Gpa);
+
+    //
+    // Already protecting this physical page? Just (re)tag it -- e.g. a free() of a
+    // buffer re-tags its data pages OVERFLOW->UAF.
+    //
+    for (i = 0; i < g_SanPageCount; i++)
+    {
+        if (g_SanPages[i].Gpa == Gpa)
+        {
+            WINAFL_SAN_KLOG(SAN_LOG_PROTECT,
+                            "[san] protect RETAG: va=0x%llx gpa=0x%llx kind %u->%u idx %u->%u",
+                            Va, Gpa, g_SanPages[i].Kind, Kind, g_SanPages[i].AllocIndex, AllocIndex);
+            g_SanPages[i].AllocIndex = AllocIndex;
+            g_SanPages[i].Kind       = Kind;
+            VmFuncEptGuardProtectPage(CoreId, Gpa, &Orig);
+            return TRUE;
+        }
+    }
+
+    if (g_SanPageCount >= WINAFL_SAN_MAX_PAGES)
+    {
+        WINAFL_SAN_KLOG(SAN_LOG_ERROR,
+                        "[san] protect TABLE-FULL: va=0x%llx gpa=0x%llx (%u pages) -- failing open",
+                        Va, Gpa, g_SanPageCount);
+        return FALSE; // table full -> fail open
+    }
+
+    if (!VmFuncEptGuardProtectPage(CoreId, Gpa, &Orig))
+    {
+        g_SanStats.ProtectFail++;
+        WINAFL_SAN_KLOG(SAN_LOG_ERROR,
+                        "[san] protect EPT-FAIL: va=0x%llx gpa=0x%llx kind=%u (split/pml1 failure) -- failing open",
+                        Va, Gpa, Kind);
+        return FALSE;
+    }
+
+    g_SanPages[g_SanPageCount].Gpa           = Gpa;
+    g_SanPages[g_SanPageCount].OriginalEntry = Orig;
+    g_SanPages[g_SanPageCount].AllocIndex    = AllocIndex;
+    g_SanPages[g_SanPageCount].Kind          = Kind;
+    g_SanPageCount++;
+
+    WINAFL_SAN_KLOG(SAN_LOG_PROTECT,
+                    "[san] protect OK: va=0x%llx gpa=0x%llx kind=%u idx=%u orig=0x%llx (pages=%u)",
+                    Va, Gpa, Kind, AllocIndex, Orig, g_SanPageCount);
+    return TRUE;
+}
+
+//
+// Protect every page in [StartVa, EndVa) (used to hold a freed buffer's data pages).
+//
+static VOID
+WinaflSanProtectRange(UINT32 CoreId, UINT64 StartVa, UINT64 EndVa, UINT32 AllocIndex, UINT32 Kind)
+{
+    UINT64 Va;
+
+    for (Va = WINAFL_SAN_PAGE_DOWN(StartVa); Va < EndVa; Va += PAGE_SIZE)
+        WinaflSanProtectPage(CoreId, Va, AllocIndex, Kind);
+}
+
+//
+// Restore + drop just ONE allocation's protected pages (identified by its index in
+// g_SanAllocs). Used when a repositioned allocation must be handed back to the real
+// allocator mid-batch (overflow-only free): its guard page has to become RWX and
+// leave g_SanPages before the frame returns to the heap, or the heap's reuse of it
+// would fault into our classifier. Swap-with-last removal is safe -- nothing indexes
+// g_SanPages by position (the classifier scans by GPA, the reset walks all entries).
+// VMX-root only.
+//
+static VOID
+WinaflSanUnprotectAlloc(UINT32 CoreId, UINT32 AllocIndex)
+{
+    UINT32 i = 0;
+
+    while (i < g_SanPageCount)
+    {
+        if (g_SanPages[i].AllocIndex == AllocIndex)
+        {
+            VmFuncEptGuardRestorePage(CoreId, g_SanPages[i].Gpa, g_SanPages[i].OriginalEntry);
+            g_SanPages[i] = g_SanPages[g_SanPageCount - 1]; // swap-with-last
+            g_SanPageCount--;
+            // do NOT advance i: re-check the entry we just swapped in
+        }
+        else
+        {
+            i++;
+        }
+    }
+}
+
+//
+// Restore every guarded page to its original EPT entry and drop the per-BATCH
+// metadata. Called at every run/batch boundary (start, normal end, crash) so the
+// target's physical frames are RWX again before it is ever torn down. Safe to call
+// when nothing is protected. VMX-root only (it touches EPT + INVEPT).
+//
+// It deliberately does NOT clear g_SanAllocs / g_SanPending -- see the lifetime model
+// at the top of the sanitizer section. Those describe pointers the GUEST still holds
+// (repositioned buffers) and allocator calls still in flight on other threads; both
+// outlive a batch, and forgetting them hands shifted pointers to the real allocator.
+// WinaflSanProcessReset() clears them, once, for a fresh target.
+//
+static VOID
+WinaflSanBatchReset(UINT32 CoreId)
+{
+    UINT32 i;
+
+    for (i = 0; i < g_SanPageCount; i++)
+        VmFuncEptGuardRestorePage(CoreId, g_SanPages[i].Gpa, g_SanPages[i].OriginalEntry);
+
+    //
+    // Only log a reset that actually did something, so the (frequent) no-op resets
+    // at run boundaries stay silent. Includes the cumulative counters so a long run
+    // still reports totals after the per-line log budget is spent.
+    //
+    if (g_SanPageCount != 0)
+    {
+        WINAFL_SAN_KLOG(SAN_LOG_RESET,
+                        "[san] reset: restored %u pages (kept %u allocs, %u pending) | totals: "
+                        "alloc(hook=%llu pass=%llu scope=%llu) post(guard=%llu open=%llu orphan=%llu slotmiss=%llu) "
+                        "fail(xlate=%llu ept=%llu) free(held=%llu pass=%llu foreign=%llu dbl=%llu) "
+                        "quarantine(now=%u evicted=%llu) faults(ours=%llu foreign=%llu)",
+                        g_SanPageCount, g_SanAllocCount, g_SanPendingTop,
+                        g_SanStats.AllocHooked, g_SanStats.AllocPassed, g_SanStats.AllocSkippedScope,
+                        g_SanStats.PostGuarded, g_SanStats.PostUnguarded, g_SanStats.PostOrphan,
+                        g_SanStats.PostSlotMiss,
+                        g_SanStats.XlateFail, g_SanStats.ProtectFail,
+                        g_SanStats.FreeHeld, g_SanStats.FreePassed, g_SanStats.FreeForeign,
+                        g_SanStats.DoubleFree,
+                        g_SanQuarantineCount, g_SanStats.QuarantineEvicted,
+                        g_SanStats.Faults, g_SanStats.ForeignFaults);
+    }
+
+    g_SanPageCount = 0;
+}
+
+//
+// Record one sanitizer malfunction and trip the circuit breaker once they add up.
+// See the WINAFL_SAN_MAX_ANOMALIES block for why this exists.
+//
+static VOID
+WinaflSanCountAnomaly(const char * What)
+{
+    if (g_SanDisabled)
+        return;
+
+    if (++g_SanAnomalies >= WINAFL_SAN_MAX_ANOMALIES)
+    {
+        g_SanDisabled = TRUE;
+        WINAFL_SAN_KLOG(SAN_LOG_ERROR,
+                        "[san] *** DISABLING the sanitizer: %u anomalies (last: %s). No further allocation "
+                        "will be guarded this session. free() interception continues for pointers already "
+                        "handed out. Fuzzing continues WITHOUT detection -- this is deliberate, it stops a "
+                        "malfunctioning sanitizer from killing the target in a loop and bug-checking the box. ***",
+                        g_SanAnomalies, What);
+    }
+    else
+    {
+        WINAFL_SAN_KLOG(SAN_LOG_ERROR,
+                        "[san] anomaly %u/%u (%s) -- sanitizer disables itself at %u",
+                        g_SanAnomalies, WINAFL_SAN_MAX_ANOMALIES, What, WINAFL_SAN_MAX_ANOMALIES);
+    }
+}
+
+//
+// Emergency: drop EVERY protection we hold, right now, and say why.
+//
+// Used from the EPT-violation classifier when continuing to hold guard pages would
+// hurt something other than the fuzz target -- an orphaned page from a dead target now
+// owned by another process, or a violation we cannot account for. Restoring the saved
+// PML1 entries puts those frames back exactly as Windows expects them, so whatever
+// faulted just re-executes and succeeds.
+//
+// The allocation records are deliberately KEPT: the guest may still hold repositioned
+// pointers, and the free hook must be able to un-shift them. Only detection stops.
+// VMX-root only.
+//
+static VOID
+WinaflSanHealOrphanedPages(UINT32 CoreId, const char * Why, UINT64 GuestPhysicalAddr)
+{
+    UINT32 Healed = g_SanPageCount;
+    UINT32 i;
+
+    for (i = 0; i < g_SanPageCount; i++)
+        VmFuncEptGuardRestorePage(CoreId, g_SanPages[i].Gpa, g_SanPages[i].OriginalEntry);
+
+    g_SanPageCount = 0;
+
+    WinaflSanCountAnomaly("emergency heal");
+
+    WINAFL_SAN_KLOG(SAN_LOG_FOREIGN,
+                    "[san] HEAL: %s -- gpa=0x%llx pid=%llu rip=0x%llx. Restored all %u protected page(s) "
+                    "and retrying the access; NOT reported as a fuzzing crash. Detection is off until the "
+                    "next allocation is guarded.",
+                    Why, GuestPhysicalAddr, (UINT64)PsGetCurrentProcessId(), VmFuncGetRip(), Healed);
+}
+
+//
+// Full reset for a FRESH target process: restore the EPT protections (which may be
+// left over from a previous target that was torn down mid-batch) AND forget every
+// reposition record. Only valid when no guest can still be holding a repositioned
+// pointer -- i.e. at the first entry hit of a newly launched target, whose heap is
+// brand new. VMX-root only.
+//
+static VOID
+WinaflSanProcessReset(UINT32 CoreId)
+{
+    WinaflSanBatchReset(CoreId);
+
+    if (g_SanAllocCount != 0 || g_SanPendingTop != 0)
+    {
+        WINAFL_SAN_KLOG(SAN_LOG_RESET,
+                        "[san] process reset: dropped %u alloc record(s), %u pending, %u quarantined "
+                        "(new target)",
+                        g_SanAllocCount, g_SanPendingTop, g_SanQuarantineCount);
+    }
+
+    g_SanAllocCount      = 0;
+    g_SanPendingTop      = 0;
+    g_SanQuarantineCount = 0; // the old process's withheld memory died with it
+}
+
+//
+// Report a guard-page / UAF detection to the fuzzer as a crash, attributed to the
+// currently-executing input (g_WinaflBatchIndex -- the same index the user side
+// blames as inputs[SegmentCount], since SegmentCount is not bumped for a run that
+// faults). Fills the generic Fault* block + the SanFault* detail, stops tracing,
+// ends the batch, restores the guard pages, parks the guest, and notifies CRASH.
+//
+static VOID
+WinaflSanReport(UINT32 CoreId, PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs, UINT32 Kind,
+                UINT32 AllocIndex, UINT64 AllocBase, UINT64 AllocSize, UINT64 AccessVa)
+{
+    UINT32 Index = g_WinaflBatchIndex;
+    UNREFERENCED_PARAMETER(AllocIndex);
+
+    Shared->SanFaultKind       = Kind;
+    Shared->SanFaultInputIndex = Index;
+    Shared->SanFaultAllocBase  = AllocBase;
+    Shared->SanFaultAllocSize  = AllocSize;
+    Shared->SanFaultAccessVa   = AccessVa;
+
+    Shared->FaultVector    = WINAFL_SAN_FAULT_VECTOR;
+    Shared->FaultErrorCode = Kind;
+    Shared->FaultRip       = VmFuncGetRip();
+    Shared->FaultAddress   = AccessVa;
+    if (Regs != NULL)
+        RtlCopyMemory(&Shared->FaultRegs, Regs, sizeof(WINAFL_HOOK_REGS));
+
+    if (Index < WINAFL_HOOK_MAX_SEGMENTS)
+        Shared->SegmentStatus[Index] = WINAFL_STATUS_CRASH;
+    Shared->Status = WINAFL_STATUS_CRASH;
+
+    g_SanStats.Faults++;
+    WINAFL_SAN_KLOG(SAN_LOG_FAULT,
+                    "[san] FAULT kind=%u (1=overflow 2=uaf 3=double-free) input=%u "
+                    "alloc=0x%llx size=0x%llx access=0x%llx rip=0x%llx idx=%u",
+                    Kind, Index, AllocBase, AllocSize, AccessVa, Shared->FaultRip, AllocIndex);
+
+    //
+    // Stop PT on this pinned core, end any batch, restore the guard pages (so the
+    // frames are RWX before the fuzzer kills the target), and park the guest in the
+    // spin stub -- it harmlessly loops there until the kill lands.
+    //
+    HyperTracePtPauseCurrentCore();
+    g_WinaflBatchActive = FALSE;
+    WinaflSanBatchReset(CoreId);
+    WinaflHookPark(Shared);
+    WinaflHookNotify(WINAFL_TAG_CRASH);
+}
+
+//
+// Allocator ENTRY (pre stage): enlarge the requested size by one alignment page +
+// one guard page, and reroute the return through the post stub so we can capture
+// RAX. Runs the real allocator afterwards (RIP is not redirected). Returns TRUE so
+// the empty event action + epilogue are skipped (avoids a per-alloc notify flood).
+//
+static BOOLEAN
+WinaflSanOnAllocEntry(PWINAFL_HOOK_SHARED Shared, GUEST_REGS * Regs, WINAFL_SAN_ALLOCATOR * Fn)
+{
+    UINT64 * SizeReg = WinaflSanRegPtr(Regs, Fn->ArgReg);
+    UINT64   Size;
+    UINT64   ReturnAddress = 0;
+    UINT64   Stub;
+
+    if ((Shared->SanitizeFlags & (WINAFL_SAN_OVERFLOW | WINAFL_SAN_UAF)) == 0 || SizeReg == NULL)
+    {
+        g_SanStats.AllocPassed++;
+        return TRUE; // nothing to do -> let the call run untouched
+    }
+
+    //
+    // Only the fuzzed code's own allocations may be repositioned (see the scope note
+    // next to g_WinaflInFuzzRun). Anything else -- the loader, the CRT, other threads,
+    // anything outside a run -- gets the real allocator, untouched. Handing those a
+    // shifted pointer kills the target as soon as it reaches an unhooked heap API.
+    //
+    if (g_SanDisabled || !g_WinaflInFuzzRun ||
+        (UINT64)PsGetCurrentThreadId() != g_WinaflFuzzThreadId)
+    {
+        g_SanStats.AllocSkippedScope++;
+        return TRUE;
+    }
+
+    Size = *SizeReg;
+
+    //
+    // Skip zero / oversized requests (their returns pass through the post stub with
+    // no pending record, which is handled harmlessly).
+    //
+    if (Size == 0 || Size > WINAFL_SAN_MAX_GUARD_SIZE)
+    {
+        g_SanStats.AllocPassed++;
+        WINAFL_SAN_KLOG(SAN_LOG_ALLOC, "[san] alloc SKIP (size=0x%llx out of range)", Size);
+        return TRUE;
+    }
+
+    if (g_SanPendingTop >= WINAFL_SAN_MAX_PENDING || Shared->PostStubAddress == 0)
+    {
+        g_SanStats.AllocPassed++;
+        WINAFL_SAN_KLOG(SAN_LOG_ERROR,
+                        "[san] alloc SKIP: pending=%u/%u stub=0x%llx -- cannot track return",
+                        g_SanPendingTop, WINAFL_SAN_MAX_PENDING, Shared->PostStubAddress);
+        return TRUE; // no room to track the return / no stub -> run normally
+    }
+
+    //
+    // Capture and reroute the return address: read [rsp], push the pending record,
+    // then overwrite [rsp] with the post stub so the allocator returns into it.
+    //
+    if (!MemoryMapperReadMemorySafeOnTargetProcess(Regs->rsp, &ReturnAddress, sizeof(ReturnAddress)))
+    {
+        g_SanStats.AllocPassed++;
+        WINAFL_SAN_KLOG(SAN_LOG_ERROR,
+                        "[san] alloc SKIP: cannot read return slot at rsp=0x%llx", Regs->rsp);
+        return TRUE; // can't read the stack -> don't risk it
+    }
+
+    g_SanPending[g_SanPendingTop].OrigSize   = Size;
+    g_SanPending[g_SanPendingTop].RealRA     = ReturnAddress;
+    g_SanPending[g_SanPendingTop].RetSlot    = Regs->rsp; // match key at the post stub
+    g_SanPending[g_SanPendingTop].HeapHandle = Regs->rcx; // heap this block comes from
+    g_SanPendingTop++;
+
+    *SizeReg = Size + WINAFL_SAN_REDZONE;
+
+    //
+    // Force zero-initialisation (e.g. HEAP_ZERO_MEMORY) so the allocator writes the
+    // WHOLE enlarged chunk -- including the guard page in the redzone -- which faults
+    // those pages in. Without this the redzone stays committed-but-not-present, so
+    // VA->PA of the guard page returns 0 at the post stub and overflow detection
+    // silently falls open. No-op when the allocator has no zero flag configured.
+    //
+    if (Fn->ZeroFlag != 0)
+    {
+        UINT64 * FlagsReg = WinaflSanRegPtr(Regs, Fn->FlagsReg);
+        if (FlagsReg != NULL)
+            *FlagsReg |= Fn->ZeroFlag;
+    }
+
+    Stub = Shared->PostStubAddress;
+    if (!MemoryMapperWriteMemorySafeOnTargetProcess(Regs->rsp, &Stub, sizeof(Stub)))
+    {
+        //
+        // Could not reroute the return: undo the pending push and the size bump so
+        // the call runs exactly as the app intended (fail open, no half state).
+        //
+        g_SanPendingTop--;
+        *SizeReg = Size;
+        g_SanStats.AllocPassed++;
+        WINAFL_SAN_KLOG(SAN_LOG_ERROR,
+                        "[san] alloc SKIP: cannot write return slot at rsp=0x%llx -- rolled back", Regs->rsp);
+        return TRUE;
+    }
+
+    g_SanStats.AllocHooked++;
+    WINAFL_SAN_KLOG(SAN_LOG_ALLOC,
+                    "[san] alloc: size=0x%llx -> 0x%llx (reg=%u) slot=0x%llx realRA=0x%llx stub=0x%llx pending=%u",
+                    Size, Size + WINAFL_SAN_REDZONE, Fn->ArgReg, Regs->rsp, ReturnAddress, Stub, g_SanPendingTop);
+    return TRUE;
+}
+
+//
+// free() ENTRY (pre stage): if the pointer is one of our guarded allocations, hold
+// it (mark its data pages no-access for UAF) and SKIP the real free by emulating a
+// near-return to the caller -- so the memory is never returned to the allocator.
+// A second free of an already-held buffer is reported as a UAF-class crash.
+//
+static BOOLEAN
+WinaflSanOnFreeEntry(PWINAFL_HOOK_SHARED Shared, UINT32 CoreId, GUEST_REGS * Regs, WINAFL_SAN_ALLOCATOR * Fn)
+{
+    UINT64 * PtrReg = WinaflSanRegPtr(Regs, Fn->ArgReg);
+    UINT64   UserPtr;
+    UINT64   ReturnAddress = 0;
+    int      Idx;
+
+    //
+    // IMPORTANT: the lookup is NOT gated on the UAF flag. Whenever we guard an
+    // allocation we hand the caller a REPOSITIONED pointer, so we must intercept
+    // every free of a tracked pointer regardless of UAF -- otherwise the real
+    // allocator receives a shifted pointer that is not a heap block base and
+    // corrupts the heap (the hang) and later faults on the reused guard frame (the
+    // bug check). Repositioning and free-interception are coupled to the SAME set.
+    //
+    if (PtrReg == NULL)
+        return TRUE; // misconfigured register -> run the real free
+
+    UserPtr = *PtrReg;
+    if (UserPtr == 0)
+        return TRUE; // free(NULL) -> run normally
+
+    Idx = WinaflSanFindAllocByUserPtr(UserPtr);
+    if (Idx < 0)
+    {
+        //
+        // Not tracked -> ordinary free. We only ever reposition allocations we also
+        // track, so an untracked pointer was never shifted by us: it is safe to pass
+        // straight through to the real allocator.
+        //
+        g_SanStats.FreeForeign++;
+        WINAFL_SAN_KLOG(SAN_LOG_FREE,
+                        "[san] free FOREIGN: ptr=0x%llx not tracked (allocs=%u) -> real free",
+                        UserPtr, g_SanAllocCount);
+        return TRUE;
+    }
+
+    if (g_SanAllocs[Idx].Freed)
+    {
+        //
+        // Double free: freeing memory we are already holding as freed. Reported as
+        // its own class (not plain UAF) so the fuzzer can name the bug precisely.
+        // Report + park (WinaflSanReport rewinds/parks the guest); the #BP path
+        // already suppressed the RIP increment.
+        //
+        g_SanStats.DoubleFree++;
+
+        //
+        // Reporting parks the guest, so it is only valid on the thread running the
+        // fuzzed function -- parking any other thread rewrites ITS RSP/RIP to the fuzz
+        // thread's park stub. A tracked pointer freed twice from another thread is not
+        // this input's bug; swallow the second free (the buffer is already held, so the
+        // real allocator must not see the shifted pointer either way) and carry on.
+        //
+        if ((UINT64)PsGetCurrentThreadId() != g_WinaflFuzzThreadId)
+        {
+            WINAFL_SAN_KLOG(SAN_LOG_FREE,
+                            "[san] free DOUBLE-FREE on a non-fuzz thread: ptr=0x%llx idx=%d -- swallowed, "
+                            "not reported (parking the wrong thread would be fatal)",
+                            UserPtr, Idx);
+            goto SkipRealFree;
+        }
+
+        WINAFL_SAN_KLOG(SAN_LOG_FREE,
+                        "[san] free DOUBLE-FREE: ptr=0x%llx idx=%d (first freed by input %u)",
+                        UserPtr, Idx, g_SanAllocs[Idx].InputIndex);
+        WinaflSanReport(CoreId, Shared, Regs, WINAFL_SAN_FAULT_DOUBLE_FREE, (UINT32)Idx,
+                        g_SanAllocs[Idx].UserPtr, g_SanAllocs[Idx].OrigSize, UserPtr);
+        return TRUE;
+    }
+
+    //
+    // ---- Quarantine full: EVICT the oldest instead of giving up on detection ----
+    //
+    // Simply passing this free through once the quarantine filled was a bug: UAF
+    // detection silently switched itself off after WINAFL_SAN_MAX_QUARANTINE frees
+    // and never came back for the life of the process. At one alloc/free per run
+    // that is a couple of seconds of coverage, which is exactly the reported
+    // "sometimes it catches the use-after-free, sometimes it doesn't".
+    //
+    // Evict instead. The guest is ALREADY inside RtlFreeHeap with a valid heap
+    // handle, valid flags, at the right IRQL, in the right process -- so point that
+    // call at the OLDEST quarantined buffer instead of the one it asked to free. The
+    // heap gets its memory back (which is what keeps the EPT split count bounded --
+    // see WINAFL_SAN_MAX_QUARANTINE), the caller's buffer is quarantined in its
+    // place, and the net quarantine size is unchanged. No RIP redirect: the real
+    // free runs, just on a different block.
+    //
+    // Only a buffer allocated from the SAME heap handle may be evicted. That is what
+    // makes this safe rather than clever: freeing a block into the wrong heap
+    // corrupts both. The handle is captured from RCX at alloc entry, and RCX is the
+    // heap for RtlAllocateHeap(Heap,Flags,Size) and RtlFreeHeap(Heap,Flags,Base)
+    // alike. For the pool-style Ex* allocators RCX is a pool type at alloc and a
+    // pointer at free, so they never match and eviction simply never happens --
+    // those fall through to the un-reposition path below, as before.
+    //
+    if ((Shared->SanitizeFlags & WINAFL_SAN_UAF) != 0 &&
+        g_SanQuarantineCount >= WINAFL_SAN_MAX_QUARANTINE)
+    {
+        int Evict = WinaflSanFindEvictionCandidate(Regs->rcx, Idx);
+
+        if (Evict >= 0)
+        {
+            UINT64 EvictReal = g_SanAllocs[Evict].RealBase;
+
+            //
+            // Drop the evicted buffer's protections BEFORE the heap can hand its
+            // pages out again, and tombstone it so no later lookup matches it.
+            //
+            WinaflSanUnprotectAlloc(CoreId, (UINT32)Evict);
+            g_SanAllocs[Evict].UserPtr = 0;
+            g_SanQuarantineCount--;
+
+            //
+            // Redirect this call at the evicted block, then quarantine the caller's
+            // buffer in its place.
+            //
+            *PtrReg = EvictReal;
+
+            g_SanAllocs[Idx].Freed      = TRUE;
+            g_SanAllocs[Idx].InputIndex = g_WinaflBatchIndex;
+            WinaflSanProtectRange(CoreId, g_SanAllocs[Idx].UserPtr, g_SanAllocs[Idx].GuardVa,
+                                  (UINT32)Idx, WINAFL_SAN_FAULT_UAF);
+            g_SanQuarantineCount++;
+
+            g_SanStats.QuarantineEvicted++;
+            WINAFL_SAN_KLOG(SAN_LOG_FREE,
+                            "[san] free EVICT: holding ptr=0x%llx idx=%d, freeing evicted idx=%d "
+                            "(real=0x%llx) through this call instead (quarantine=%u)",
+                            UserPtr, Idx, Evict, EvictReal, g_SanQuarantineCount);
+            return TRUE; // real free runs, on the evicted block
+        }
+
+        //
+        // Nothing evictable from this heap -- fall through and pass this one through
+        // un-repositioned, as before.
+        //
+    }
+
+    if ((Shared->SanitizeFlags & WINAFL_SAN_UAF) == 0 ||
+        g_SanQuarantineCount >= WINAFL_SAN_MAX_QUARANTINE)
+    {
+        //
+        // ---- Overflow-only, or quarantine full with nothing evictable:
+        // ---- un-reposition and let the REAL free run ----
+        // We repositioned this allocation for the guard page but are not holding
+        // freed buffers. Undo it: restore + drop this allocation's guard page (so the
+        // frame can safely return to the heap), rewrite the pointer register back to
+        // the real block base, and fall through to the real allocator. No RIP redirect
+        // -- the real free executes normally.
+        //
+        // We MARK the record freed but DO NOT tombstone it (UserPtr stays set), so a
+        // second free of the same pointer is caught as a double free below instead of
+        // being passed through to the real allocator as a shifted pointer (which would
+        // corrupt the heap and hang). If the heap later reuses this chunk, the post
+        // stub retires this record by RealBase, so there is no stale-record ambiguity.
+        //
+        UINT64 Real = g_SanAllocs[Idx].RealBase;
+
+        WinaflSanUnprotectAlloc(CoreId, (UINT32)Idx);
+        *PtrReg                     = Real;  // hand the real block base to the allocator
+        g_SanAllocs[Idx].Freed      = TRUE;  // keyed record kept for double-free detection
+        g_SanAllocs[Idx].InputIndex = g_WinaflBatchIndex;
+
+        g_SanStats.FreePassed++;
+        WINAFL_SAN_KLOG(SAN_LOG_FREE,
+                        "[san] free UNREPOSITION: user=0x%llx -> real=0x%llx idx=%d (guard restored) -> real free",
+                        UserPtr, Real, Idx);
+        return TRUE;
+    }
+
+    //
+    // ---- UAF on: first free -> HOLD the buffer ----
+    // Protect its data pages [UserPtr, GuardVa) as UAF (page-aligned start means
+    // these pages are exclusively ours -- no bleed). The guard page beyond GuardVa is
+    // already no-access from the alloc when overflow is also on. Then SKIP the real
+    // free by emulating a near-return, so the memory is never returned to the
+    // allocator.
+    //
+    g_SanAllocs[Idx].Freed      = TRUE;
+    g_SanAllocs[Idx].InputIndex = g_WinaflBatchIndex;
+    WinaflSanProtectRange(CoreId, g_SanAllocs[Idx].UserPtr, g_SanAllocs[Idx].GuardVa,
+                          (UINT32)Idx, WINAFL_SAN_FAULT_UAF);
+
+    //
+    // This buffer is now withheld from the allocator for the life of the process, so
+    // it counts against the quarantine bound (see WINAFL_SAN_MAX_QUARANTINE).
+    //
+    g_SanQuarantineCount++;
+    if (g_SanQuarantineCount == WINAFL_SAN_MAX_QUARANTINE)
+    {
+        WINAFL_SAN_KLOG(SAN_LOG_FREE,
+                        "[san] quarantine FULL at %u buffers (~%u KB withheld) -- further frees go "
+                        "through to the allocator so the heap can recycle memory. Holding more would "
+                        "leak a permanent 4KB non-paged EPT split per fresh physical page.",
+                        g_SanQuarantineCount,
+                        (UINT32)((g_SanQuarantineCount * (WINAFL_SAN_REDZONE + 0x1000)) / 1024));
+    }
+
+    //
+    // Skip the real free: emulate a near-return (pop the return address, jump to it).
+    // RAX = TRUE for RtlFreeHeap-style BOOLEAN returns. RSP is VMCS state, so it is
+    // updated via SetGuestRSP; the mirror (Regs->rsp) is kept in step defensively.
+    //
+    // Also reached by the swallowed non-fuzz-thread double free above: that buffer is
+    // already held and already protected, and all that is left to do is keep the real
+    // allocator from ever seeing the shifted pointer.
+    //
+SkipRealFree:
+    if (!MemoryMapperReadMemorySafeOnTargetProcess(Regs->rsp, &ReturnAddress, sizeof(ReturnAddress)))
+        return TRUE; // can't emulate the return -> fall back to the real free
+
+    Regs->rsp += sizeof(UINT64);
+    SetGuestRSP(Regs->rsp);
+    if (Fn->RetIsBool)
+        Regs->rax = 1;
+    VmFuncSetRip(ReturnAddress);
+
+    g_SanStats.FreeHeld++;
+    WINAFL_SAN_KLOG(SAN_LOG_FREE,
+                    "[san] free HELD: ptr=0x%llx idx=%d size=0x%llx pages[0x%llx..0x%llx) "
+                    "skipped real free, ret->0x%llx",
+                    UserPtr, Idx, g_SanAllocs[Idx].OrigSize,
+                    WINAFL_SAN_PAGE_DOWN(g_SanAllocs[Idx].UserPtr), g_SanAllocs[Idx].GuardVa,
+                    ReturnAddress);
+    return TRUE;
+}
+
+//
+// Return-trampoline (post stage): the allocator has returned into the post stub.
+// Capture RAX (the real base), place the caller's buffer so its last byte ends on a
+// page boundary with the guard page right after, protect that guard page, record
+// the allocation, hand the repositioned pointer back in RAX, and return to the real
+// caller. Fails open (returns the real base, no guard) if the guard page cannot be
+// protected (e.g. not present) or a table is full.
+//
+static BOOLEAN
+WinaflSanOnPostStub(PWINAFL_HOOK_SHARED Shared, UINT32 CoreId, GUEST_REGS * Regs)
+{
+    WINAFL_SAN_PENDING Pending = {0};
+    UINT64             RetSlot;
+    UINT64             RealBase;
+    UINT64             GuardVa;
+    UINT64             UserPtr;
+    UINT32             Slot;
+    UINT32             p;
+    BOOLEAN            Found     = FALSE;
+    BOOLEAN            WantGuard = FALSE;
+    BOOLEAN            Track     = FALSE;
+
+    //
+    // Find OUR pending record by the stack slot this return consumed. The allocator
+    // reached us with `ret`, which popped the slot we planted the stub in, so that
+    // slot is exactly RSP-8 now. Matching on it (rather than popping a LIFO) is what
+    // keeps interleaved allocator calls from other threads of the target -- all of
+    // which run through this same shared-ntdll hook -- from stealing each other's
+    // size and return address. Newest first: a recursive allocator reuses stack
+    // depth, so the most recent record for a slot is the right one.
+    //
+    RetSlot = Regs->rsp - sizeof(UINT64);
+
+    for (p = g_SanPendingTop; p > 0; p--)
+    {
+        if (g_SanPending[p - 1].RetSlot == RetSlot)
+        {
+            Pending                = g_SanPending[p - 1];
+            g_SanPending[p - 1]    = g_SanPending[g_SanPendingTop - 1]; // swap-with-last
+            g_SanPendingTop--;
+            Found = TRUE;
+            break;
+        }
+    }
+
+    if (!Found && g_SanPendingTop != 0)
+    {
+        //
+        // Slot match failed but we DO have in-flight records. Fall back to the most
+        // recent one (the original LIFO behaviour) instead of giving up.
+        //
+        // This matters enormously: the only thing we cannot reconstruct here is the
+        // caller's real return address, and without it the sole option is to park --
+        // which silently hangs the run, times out, gets the target killed, and orphans
+        // guard pages. A slightly wrong pairing is recoverable; a park is not. So the
+        // slot key is treated as an OPTIMISATION for correct pairing under thread
+        // interleaving, never as a reason to abandon the guest.
+        //
+        // If this fires often, the RSP mirror at the post stub does not line up with
+        // the alloc entry's (`rsp-8`) the way it is assumed to, and the slot key is
+        // simply wrong for this allocator -- the counter below is how you find that out.
+        //
+        Pending = g_SanPending[--g_SanPendingTop];
+        Found   = TRUE;
+
+        g_SanStats.PostSlotMiss++;
+        WINAFL_SAN_KLOG(SAN_LOG_ERROR,
+                        "[san] post SLOT-MISS: no record for slot=0x%llx (rsp=0x%llx); fell back to the "
+                        "newest pending (size=0x%llx ra=0x%llx, %u left). Pairing may be wrong but the "
+                        "guest continues.",
+                        RetSlot, Regs->rsp, Pending.OrigSize, Pending.RealRA, g_SanPendingTop);
+    }
+
+    if (!Found)
+    {
+        //
+        // Genuinely nothing in flight: the caller's real return address is gone and
+        // cannot be reconstructed, so parking is all that is left. Notify a crash so
+        // the fuzzer kills and relaunches immediately instead of waiting out a per-run
+        // timeout -- a silent park here is what turns into a hang, a dead target, and
+        // orphaned guard pages.
+        //
+        g_SanStats.PostOrphan++;
+        WINAFL_SAN_KLOG(SAN_LOG_ERROR,
+                        "[san] post ORPHAN: empty pending stack at slot=0x%llx (rax=0x%llx rsp=0x%llx) -- "
+                        "parking + reporting so the target is relaunched rather than left hanging",
+                        RetSlot, Regs->rax, Regs->rsp);
+        WinaflSanCountAnomaly("post-stub with empty pending stack");
+        WinaflSanBatchReset(CoreId);
+        WinaflHookPark(Shared);
+        WinaflHookNotify(WINAFL_TAG_CRASH);
+        return TRUE;
+    }
+
+    RealBase = Regs->rax;
+
+    if (RealBase == 0)
+    {
+        WINAFL_SAN_KLOG(SAN_LOG_POST,
+                        "[san] post: allocation FAILED (size=0x%llx) -> returning NULL to 0x%llx",
+                        Pending.OrigSize, Pending.RealRA);
+        VmFuncSetRip(Pending.RealRA); // allocation failed -> return NULL unchanged
+        return TRUE;
+    }
+
+    //
+    // Guard placement. GuardVa = PAGE_UP(RealBase) + PAGE_UP(OrigSize) makes BOTH
+    // ends clean: the buffer's last byte lands on a page boundary (guard page right
+    // after -> byte-precise overflow) AND its first page starts at PAGE_UP(RealBase)
+    // >= RealBase, so every page we ever protect is exclusively inside THIS
+    // allocation (no bleed into the previous heap chunk). The 3-page redzone
+    // (WINAFL_SAN_REDZONE) guarantees this fits.
+    //
+    GuardVa = WINAFL_SAN_PAGE_UP(RealBase) + WINAFL_SAN_PAGE_UP(Pending.OrigSize);
+    UserPtr = GuardVa - Pending.OrigSize;
+
+    WantGuard = (Shared->SanitizeFlags & WINAFL_SAN_OVERFLOW) != 0;
+
+    //
+    // Reserve the record slot BEFORE protecting: the guard page's reverse map stores
+    // this index, so it has to be final by then. Nothing is committed until Track --
+    // a failed guard must leave the table exactly as it was.
+    //
+    Slot = WinaflSanPeekSlot();
+
+    if (Slot != WINAFL_SAN_NO_SLOT)
+    {
+        if (WantGuard)
+        {
+            //
+            // Overflow on: protect the trailing guard page now. Only track (and
+            // therefore reposition) the allocation if the guard actually went down;
+            // otherwise fall fully open so we never hand out a shifted pointer we
+            // cannot police.
+            //
+            Track = WinaflSanProtectPage(CoreId, GuardVa, Slot, WINAFL_SAN_FAULT_OVERFLOW);
+        }
+        else if (Shared->SanitizeFlags & WINAFL_SAN_UAF)
+        {
+            //
+            // UAF-only: reposition + track with NO trailing guard page (the buffer's
+            // data pages are protected at free time). Same placement math, so the
+            // held pages never overlap a neighbouring chunk.
+            //
+            Track = TRUE;
+        }
+    }
+
+    if (Track)
+    {
+        //
+        // If the heap just reused memory we previously real-freed (overflow-only
+        // un-reposition), retire those stale records so a later free of THIS new
+        // allocation cannot match one and be misreported as a double free.
+        //
+        WinaflSanRetireStaleRecords(RealBase, Pending.OrigSize + WINAFL_SAN_REDZONE);
+
+        g_SanAllocs[Slot].UserPtr    = UserPtr;
+        g_SanAllocs[Slot].RealBase   = RealBase;
+        g_SanAllocs[Slot].OrigSize   = Pending.OrigSize;
+        g_SanAllocs[Slot].GuardVa    = GuardVa;
+        g_SanAllocs[Slot].HeapHandle = Pending.HeapHandle;
+        g_SanAllocs[Slot].InputIndex = g_WinaflBatchIndex;
+        g_SanAllocs[Slot].Freed      = FALSE;
+
+        if (Slot == g_SanAllocCount)
+            g_SanAllocCount++; // fresh append (a recycled slot is already counted)
+
+        Regs->rax = UserPtr; // hand the repositioned pointer to the caller
+
+        g_SanStats.PostGuarded++;
+        WINAFL_SAN_KLOG(SAN_LOG_POST,
+                        "[san] post %s: real=0x%llx size=0x%llx -> user=0x%llx last=0x%llx "
+                        "guard=0x%llx idx=%u ra=0x%llx",
+                        WantGuard ? "GUARDED" : "TRACKED(uaf)",
+                        RealBase, Pending.OrigSize, UserPtr, UserPtr + Pending.OrigSize - 1,
+                        GuardVa, Slot, Pending.RealRA);
+    }
+    else
+    {
+        //
+        // Not tracked: the caller gets the real (over-sized) base UNCHANGED, so a
+        // later free of it is an ordinary free with nothing shifted. Happens when the
+        // overflow guard could not be placed (page not present / tables full) or
+        // neither detector wants this allocation.
+        //
+        g_SanStats.PostUnguarded++;
+        WINAFL_SAN_KLOG(SAN_LOG_POST,
+                        "[san] post UNTRACKED: real=0x%llx size=0x%llx (no guard placed) -- returned as-is",
+                        RealBase, Pending.OrigSize);
+    }
+
+    VmFuncSetRip(Pending.RealRA);
+    return TRUE;
+}
+
+//
+// EPT-violation classifier (called from AttachingCheckUnhandledEptViolation, in
+// VMX-root on the faulting core). If the faulting physical page is one we forced to
+// no-access, classify it (guard page => overflow, held freed page => UAF), report a
+// crash for the current input, and return TRUE (handled). Otherwise return FALSE so
+// the normal HyperDbg path runs.
+//
 BOOLEAN
-MasoudPrologue(PVOID        Context,
-               GUEST_REGS * Regs)
+WinaflSanHandleEptViolation(UINT32 CoreId, UINT64 ViolationQualification, UINT64 GuestPhysicalAddr)
 {
     PWINAFL_HOOK_SHARED Shared = g_WinaflHookShared;
-    UINT64              Va     = (UINT64)Context;
+    UINT64              Gpa    = WINAFL_SAN_PAGE_DOWN(GuestPhysicalAddr);
+    UINT32              i;
+
+    UNREFERENCED_PARAMETER(ViolationQualification);
+
+    if (Shared == NULL || Shared->SanitizeFlags == 0 || g_SanPageCount == 0)
+        return FALSE; // sanitizer not active -> not ours
+
+    for (i = 0; i < g_SanPageCount; i++)
+    {
+        if (g_SanPages[i].Gpa == Gpa)
+        {
+            UINT32 AllocIndex;
+            UINT64 Base;
+            UINT64 Size;
+
+            //
+            // ---- Is this REALLY the fuzzed code faulting? ----
+            // Reporting means parking the guest: rewriting RSP and RIP to the target's
+            // user-mode park stub. That is only meaningful for the one thread running
+            // the fuzzed function. Doing it to anything else corrupts whatever was
+            // actually executing, and if that is a kernel thread it bug-checks the box
+            // immediately. So ALL THREE of these must hold, and each guards a real case:
+            //
+            //   * right process -- a dead target leaves no-access frames behind (nothing
+            //     runs in VMX-root to restore them), Windows recycles them, and the next
+            //     process to touch one lands here with a matching GPA.
+            //
+            //   * USER MODE -- this is the subtle one, and it needs no target death at
+            //     all. A guard page is a physical frame; the kernel touches guest frames
+            //     from inside the target's process context routinely (working-set
+            //     trimming, zeroing, paging I/O). PsGetCurrentProcessId() MATCHES for
+            //     those, so a process check alone lets a kernel thread through -- and
+            //     parking a kernel thread on a user-mode stub is an instant bug check.
+            //     A kernel RIP is the reliable tell.
+            //
+            //   * right thread -- another user thread of the target touching the buffer
+            //     is not this input's crash, and parking it would restore the FUZZ
+            //     thread's RSP onto the wrong stack.
+            //
+            // Anything else: heal and retry. The saved PML1 entry is that frame's
+            // correct present/RWX mapping, so restoring is always safe.
+            //
+            {
+                UINT64  FaultRip   = VmFuncGetRip();
+                BOOLEAN RightProc  = ((UINT64)PsGetCurrentProcessId() == (UINT64)Shared->TargetProcessId);
+                BOOLEAN UserMode   = (FaultRip < 0xFFFF800000000000ull);
+                BOOLEAN RightThrd  = ((UINT64)PsGetCurrentThreadId() == g_WinaflFuzzThreadId);
+
+                if (!RightProc || !UserMode || !RightThrd)
+                {
+                    WinaflSanHealOrphanedPages(CoreId,
+                                               !RightProc ? "guard page hit by a FOREIGN PROCESS" :
+                                               !UserMode  ? "guard page hit from KERNEL MODE (frame touched by the OS)" :
+                                                            "guard page hit by a non-fuzz thread",
+                                               GuestPhysicalAddr);
+                    VmFuncSuppressRipIncrement(CoreId);
+                    return TRUE;
+                }
+            }
+
+            AllocIndex = g_SanPages[i].AllocIndex;
+            Base       = (AllocIndex < g_SanAllocCount) ? g_SanAllocs[AllocIndex].UserPtr : 0;
+            Size       = (AllocIndex < g_SanAllocCount) ? g_SanAllocs[AllocIndex].OrigSize : 0;
+
+            //
+            // FaultRegs is left unfilled here (NULL): during an EPT violation this
+            // path is not reached through DebuggerTriggerEvents, so the per-core
+            // saved GUEST_REGS would be stale. FaultRip (below) is read live.
+            //
+            // AccessVa carries the faulting guest-PHYSICAL address here (the guest
+            // linear address is in the VMCS but not exported to hyperkd). The offending
+            // allocation is already identified exactly by Base/Size, and FaultRip says
+            // which instruction did it, so this is enough to triage.
+            //
+            WinaflSanReport(CoreId, Shared, NULL, g_SanPages[i].Kind, AllocIndex, Base, Size, GuestPhysicalAddr);
+
+            //
+            // EPT violations do not advance RIP for us; suppress the framework's
+            // default increment so our park redirect (in WinaflSanReport) stands.
+            //
+            VmFuncSuppressRipIncrement(CoreId);
+            return TRUE;
+        }
+    }
+
+    //
+    // An EPT violation whose GPA we do not recognise, while we are still holding
+    // protections. Left alone this returns FALSE into HyperDbg's LogError +
+    // DbgBreakPoint(), which on a box with no kernel debugger attached is a bug check.
+    //
+    // We are almost certainly the cause: nothing else in this configuration denies
+    // access to guest frames. Bug-checking the user's machine to report our own stale
+    // bookkeeping is the worst possible outcome, so drop every protection we hold and
+    // let the instruction retry. Detection stops for this batch; the box survives.
+    //
+    g_SanStats.ForeignFaults++;
+    WinaflSanHealOrphanedPages(CoreId, "unrecognised EPT violation while guards were live", GuestPhysicalAddr);
+    VmFuncSuppressRipIncrement(CoreId);
+    return TRUE;
+}
+
+BOOLEAN
+MasoudPrologue(UINT32       CoreId,
+               PVOID        Context,
+               GUEST_REGS * Regs)
+{
+    PWINAFL_HOOK_SHARED    Shared = g_WinaflHookShared;
+    UINT64                 Va     = (UINT64)Context;
+    WINAFL_SAN_ALLOCATOR * Fn;
 
 #if WINAFL_HOOK_KERNEL_VERBOSE
     //
@@ -589,16 +2207,37 @@ MasoudPrologue(PVOID        Context,
         return FALSE;
     }
 
+    //
+    // ---- Sanitizer routing (only when armed with SanitizeFlags) ----
+    // The allocator/free entries and the return-trampoline stub are separate
+    // !epthooks; route their hits to the guard-page sanitizer. All of these return
+    // TRUE so the empty event action + epilogue are skipped.
+    //
+    if (Shared->SanitizeFlags != 0)
+    {
+        if (Va == Shared->PostStubAddress)
+            return WinaflSanOnPostStub(Shared, CoreId, Regs);
+
+        Fn = WinaflSanFindAllocatorByAddr(Shared, Va);
+        if (Fn != NULL)
+        {
+            if (Fn->Kind == WINAFL_SAN_FN_ALLOC)
+                return WinaflSanOnAllocEntry(Shared, Regs, Fn);
+            if (Fn->Kind == WINAFL_SAN_FN_FREE)
+                return WinaflSanOnFreeEntry(Shared, CoreId, Regs, Fn);
+        }
+    }
+
     if (Va == Shared->FuzzAddress)
     {
         WINAFL_KLOG("[winafl] entry hook hit (first=%d)", Shared->FirstHitDone);
-        return WinaflHookOnEntry(Shared, Regs);
+        return WinaflHookOnEntry(CoreId, Shared, Regs);
     }
 
     if (Shared->FirstHitDone && Va == Shared->ReturnAddress)
     {
         WINAFL_KLOG("[winafl] return hook hit (iter=%lld)", Shared->IterationCount);
-        return WinaflHookOnReturn(Shared, Regs);
+        return WinaflHookOnReturn(CoreId, Shared, Regs);
     }
 
     //
@@ -610,11 +2249,13 @@ MasoudPrologue(PVOID        Context,
 }
 
 VOID
-MasoudEpilogue(PVOID        Context,
+MasoudEpilogue(UINT32       CoreId,
+               PVOID        Context,
                GUEST_REGS * Regs)
 {
     PWINAFL_HOOK_SHARED Shared = g_WinaflHookShared;
     UNREFERENCED_PARAMETER(Regs);
+    UNREFERENCED_PARAMETER(CoreId);
 
     //
     // Only the return-address hook reaches here (the entry/park branches return
@@ -1933,7 +3574,7 @@ DebuggerTriggerEvents(VMM_EVENT_TYPE_ENUM                   EventType,
             //
             // Call the prologue function
             //
-            SkipUserModeCall = MasoudPrologue(Context, Regs);
+            SkipUserModeCall = MasoudPrologue(DbgState->CoreId, Context, Regs);
 
             if (SkipUserModeCall)
             {
@@ -2218,7 +3859,7 @@ DebuggerTriggerEvents(VMM_EVENT_TYPE_ENUM                   EventType,
         //
         if (CallEpilogue)
         {
-            MasoudEpilogue(Context, Regs);
+            MasoudEpilogue(DbgState->CoreId, Context, Regs);
         }
     }
 
